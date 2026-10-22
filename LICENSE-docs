@@ -1,0 +1,18 @@
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+
+The documents in this repository are licensed under CC BY 4.0: every file under
+docs/, and CLAUDE.md, README.md, RESULTS.md, PROVENANCE.md and SECURITY.md.
+
+You may share and adapt them for any purpose, including commercially, provided
+you give appropriate credit, link to the licence, and indicate if changes were
+made. Suggested attribution:
+
+    "Argus platform documents", Richard Termondt, CC BY 4.0,
+    from this repository's URL.
+
+Full legal text:  https://creativecommons.org/licenses/by/4.0/legalcode
+Summary:          https://creativecommons.org/licenses/by/4.0/
+
+The code (src/, tests/, scripts/, the configuration, packaging and workflow
+files) is licensed separately, under the Apache License, Version 2.0: see
+LICENSE and NOTICE.

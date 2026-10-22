@@ -1,0 +1,5 @@
+# Manaully managed blackout dates - 
+# use for vacation or other day firm decides to be out of market
+# One ISO date per line. Blank lines and # comments are ignored.
+# Argus refuses ALL new entries on these dates (whole-day blackout).
+

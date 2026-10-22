@@ -1,0 +1,48 @@
+-- 0005_order_leg_fill_prices: what the legs actually FILLED at, per leg, durably.
+--
+-- The watchdog's dominant stop is "cost to close has reached N x the credit
+-- received", and until now the credit it was measured against was the filled
+-- opening order's LIMIT (`orders.limit_price`), read by `store._open_spreads`.
+-- A limit order fills at the limit OR BETTER, so that basis is LOW and the stop
+-- is TIGHT by the same margin — the conservative direction, which is why it was
+-- deferred as a reporting improvement for two months.
+--
+-- 2026-09-01 ended that. `put-7630-7625` recorded 0.45 (the walk's final limit)
+-- and collected 0.50 on both contracts; it stopped at 0.925 against a stop of
+-- 0.90, where the true basis puts the stop at 1.00 and it is never stopped out at
+-- all. Five observations now exist and the gap is one half-tick to one tick of
+-- price improvement every time.
+--
+-- Two columns, not one, because an AVERAGE cannot be aggregated across orders
+-- and a NOTIONAL can. A walk that reprices fills across several
+-- `broker_order_id`s under one `external_identifier` (1429812 filled 1 contract,
+-- 1429813 filled 1), so the realized credit for a trade idea is the
+-- contracts-weighted average over EVERY opening order it has — which needs the
+-- weight carried alongside the money.
+--
+-- `priced_quantity` is the PRICED SUBSET of `applied_quantity` and may be less
+-- than it: `LegFill` is best-effort detail (see `models.OrderLeg`), and a broker
+-- that books contracts without pricing them is a known state, not corruption.
+-- Zero on both columns means "no realized price known", which reads back as the
+-- LIMIT basis — bit for bit the behaviour every row written before this
+-- migration already had. That is the whole transition plan: no backfill, because
+-- Argus trades 0DTE only and every position predating the deploy is settled
+-- within its own session, and because reconstructing ledger state from the audit
+-- log would make a second writer of the thing the ledger is authoritative over.
+--
+-- Written by `store._apply_leg` inside the SAME transaction as `applied_quantity`
+-- and `positions`, from the `OrderLeg.fill_price(already, filled)` that call
+-- already computes for the slice it is booking. Idempotent for the same reason
+-- `applied_quantity` is: the write rides behind the `filled <= already` return.
+--
+-- NOT on `positions`: that table is keyed by SYMBOL, and chained verticals net to
+-- zero at a shared strike (`signal.width = 5.0` on SPX's 5-point ladder makes
+-- that the common case), which is why the price column it already has is
+-- documented as safety-irrelevant. NOT on `orders`: one row per BROKER ORDER is
+-- one rung of a walk, and a per-order price still misses rung 1.
+--
+-- Immutable: never edit this file — add a new migration.
+-- → docs/decisions/2026-09-02-the-credit-stop-basis-and-its-comparison.md
+
+ALTER TABLE order_legs ADD COLUMN priced_quantity INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE order_legs ADD COLUMN priced_notional REAL    NOT NULL DEFAULT 0.0;

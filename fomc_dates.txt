@@ -1,0 +1,31 @@
+# FOMC rate-decision dates — HAND-MAINTAINED, and deliberately so.
+#
+# FRED publishes DATA RELEASES; an FOMC decision is not one, so there is no
+# release id to query and no authoritative API to hit. `argus.tools.blackout_dates`
+# merges this file with the CPI/NFP/PCE dates it fetches from FRED.
+#
+# Source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+#
+# Use the SECOND (decision) day of each two-day meeting — the day the statement
+# lands at 14:00 ET and realized vol actually resolves. The first day of the
+# meeting is not the risk event.
+#
+# The Fed publishes the following year's calendar well in advance. Extend this
+# file when it does, then re-run:
+#   ./.venv/bin/python -m argus.tools.blackout_dates --out blackout_dates.txt
+# or append one date without hand-editing:
+#   ./.venv/bin/python -m argus.tools.blackout_dates --add-fomc 2027-01-27 --out blackout_dates.txt
+
+# --- 2026 ---
+2026-01-28
+2026-03-18
+2026-04-29
+2026-06-17
+2026-07-29
+2026-09-16
+2026-10-28
+2026-12-09
+
+# 2027 dates are NOT yet in this file. Add them from the Fed calendar as soon as
+# they are published — a blackout list that runs out is indistinguishable, from
+# inside the running process, from a day with no scheduled event.

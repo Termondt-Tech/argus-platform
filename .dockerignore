@@ -1,0 +1,51 @@
+# Build-context exclusions.
+#
+# This is the primary control that keeps secrets and runtime state OUT of the
+# image. Anything listed here is never sent to the daemon, so it cannot end up
+# in a layer even by accident — and layers are forever, `rm` in a later RUN does
+# not remove a file from an earlier one.
+
+# --- secrets: never, under any circumstances -------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- runtime state: belongs on the volume, not in a layer -------------------
+# Baking a 2.7 GB-and-growing audit database into the image would also make
+# every rollback restore a stale hash chain.
+*.db
+*.db-wal
+*.db-shm
+
+# --- host build artefacts: wrong architecture, and they'd shadow the venv ---
+.venv/
+**/__pycache__/
+**/*.pyc
+*.egg-info/
+src/*.egg-info/
+.pytest_cache/
+
+# --- not needed at runtime --------------------------------------------------
+.git/
+.gitignore
+.github/
+.claude/
+tests/
+docs/
+CLAUDE.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+argus.service
+argus-shadow.service
+argus-shadow.timer
+argus-snapshot.service
+argus-snapshot.timer
+scripts/
+.DS_Store
+**/.DS_Store
+
+# Writer-lock sidecars — runtime only
+*.db.lock

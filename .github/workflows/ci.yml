@@ -1,0 +1,138 @@
+# Argus CI — independent verification, nothing else.
+#
+# What a green check on `main` means, precisely:
+#
+#   * the full test suite passes from a CLEAN amd64 checkout with NO secrets and
+#     no network access to tastytrade,
+#   * no migration that already shipped was modified, deleted or renamed,
+#   * the production image builds on amd64 — the droplet's architecture, not the
+#     arm64 Mac the code is written on.
+#
+# What it does NOT do, deliberately and permanently: DEPLOY. There is no CD here
+# and none is coming. The droplet pulls with a read-only deploy key and a human
+# starts it; that is a security posture, not a gap waiting to be filled. Nothing
+# in this file should ever acquire registry credentials, an SSH key, or a
+# `deploy` job. Anything that needs to run on a SCHEDULE belongs in systemd on
+# the droplet, not in Actions.
+#
+# ZERO SECRETS. This workflow references no `secrets.*` and must continue not to.
+# The tests were built to boot credential-free; if one ever needs a credential or
+# a live endpoint, mark it and exclude it here rather than adding a secret — a
+# repo that can reach the broker from CI is a repo where a bad PR can trade.
+#
+# Third-party actions are pinned by full commit SHA, not tag. Tags are mutable;
+# this repo is headed for live order flow and an action that can silently change
+# under us is an unacceptable supply-chain surface. The `# vX.Y.Z` comment is for
+# humans — the SHA is what runs.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+# Nothing here writes. No packages, no releases, no PR comments, no pages.
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the older run irrelevant — cancel it rather
+# than paying for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Matches `python:3.12.13-slim-bookworm` in the Dockerfile. CI must exercise
+  # the interpreter the droplet actually runs, not whatever the runner defaults
+  # to — a 3.12.x difference is exactly the kind of thing that shows up at 09:30
+  # rather than in review. Bump BOTH together.
+  PYTHON_VERSION: "3.12.13"
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        # Exactly what CLAUDE.md tells a developer to run. Not a CI-special
+        # install path — if this diverges from the documented one, the divergence
+        # is the bug.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run the test suite
+        # No ARGUS_* env, no .env file, no credentials. A test that needs one
+        # will fail here, and that failure is the finding.
+        run: python -m pytest
+
+  migration-check:
+    name: migration-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the check diffs against a base commit, which a shallow
+          # clone does not contain. Without this the script exits 2 ("cannot
+          # run") rather than passing vacuously — but a job that cannot run is
+          # not a job that checked anything.
+          fetch-depth: 0
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Ensure the PR base ref is present
+        if: github.event_name == 'pull_request'
+        # On a pull_request event checkout resolves the MERGE ref; the base
+        # branch is not guaranteed to exist as a remote-tracking ref, and the
+        # script diffs against `origin/<base>`. Passed through env rather than
+        # interpolated into the shell — a branch name is attacker-controlled text.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+
+      - name: Check migration immutability
+        # Stdlib only, no install step — the script deliberately does not import
+        # the argus package, so it runs against a bare checkout.
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python scripts/check_migrations.py
+
+  docker-build:
+    name: docker-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the production image
+        # Build only — no push, no registry, no credentials. The runner is amd64,
+        # the same architecture as the droplet, so this is the standing check
+        # that the hash-pinned requirements.txt resolves on amd64 and not just on
+        # the arm64 Mac it was generated from. `--require-hashes` inside the
+        # Dockerfile means a wheel that is missing or wrong for this platform
+        # fails the build rather than silently substituting.
+        run: docker build --progress=plain -t argus:ci .
+
+      - name: Show image size
+        # Informational: a sudden jump usually means the build context or a layer
+        # picked up something it should not have.
+        run: docker image ls argus:ci

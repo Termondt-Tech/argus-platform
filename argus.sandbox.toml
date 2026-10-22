@@ -1,0 +1,1037 @@
+# Argus runtime configuration.
+#
+# This file holds the values the spec forbids hardcoding. Secrets (tastytrade
+# OAuth credentials) do NOT live here — they come from the environment / a
+# secret store, and are never committed.
+#
+# `environment` is the AUTHORITY on trading behaviour and is NOT overridable at
+# launch. ARGUS_ENV selects the FILE (`sandbox` -> argus.sandbox.toml) and the
+# loader refuses when the filename and this key disagree — see
+# config.resolve_config_path / _check_profile. Per the rollout plan (spec §10) no
+# phase skips shadow -> sandbox -> live-minimum-size -> scale.
+environment = "sandbox"
+
+[broker]
+# Timeout (seconds) for every broker REST call. NOT a library default — the
+# tastytrade SDK passes no timeout to httpx, so this was silently 5s until
+# 2026-07-23, when the droplet's first shadow run died on a cold
+# GET /customers/me/accounts at exactly that bound. The cert API is documented
+# below (staleness.account_refresh_timeout_s) as hanging and 502-ing; a first
+# authenticated call from a new host is when that bites.
+#
+# This is the client-wide DEFAULT. Callers needing a tighter bound still set
+# their own — the account liveness refresher wraps its round trip in
+# asyncio.timeout(account_refresh_timeout_s), which cancels first.
+http_timeout_s = 30.0
+# WHICH tastytrade account this process trades. EMPTY here = unpinned: take the
+# login's first account, which is what every environment did before 2026-09-10 and
+# is harmless on a cert login holding one account. Deliberately not pinned: cert
+# accounts are re-provisioned by tastytrade, and a pinned number that stops
+# existing is a PERMANENT SessionAborted that parks the process.
+#
+# `environment = "live"` REFUSES an empty value (config.py) — that is the whole
+# point of the key, and the reason it exists in this file at all is that
+# tests/test_config_profiles.py requires identical key sets across the profiles.
+# -> docs/decisions/2026-08-31-live-account-is-not-dedicated.md
+account_number = ""
+
+[reconcile]
+# How long the broker gets to answer "what am I holding?", and for how long we
+# keep asking. Added 2026-08-26 after a cert 502 restarted the process five times
+# in 33 seconds — the reconcile had no retry and no handler, so it killed the
+# process and Docker restarted it into the same wall, with no /status and no
+# /kill for the whole episode.
+# → docs/designs/2026-08-26-reconcile-broker-unreachable.md
+#
+# ONE HTTP attempt. Deliberately NOT broker.http_timeout_s (30s), which is sized
+# for a cold FIRST authenticated call from a new IP; by the time the reconcile
+# fetches run they are the second and third calls of the process. Anchored at 2x
+# the already-tuned staleness.account_refresh_timeout_s (5.0), on the reasoning
+# that a once-per-session reconcile can be more patient than a 10s-cadence
+# liveness refresh and needs far less than a cold start. Only bites when the
+# broker accepts a socket and never answers — a 502 or a refused connection
+# returns in milliseconds.
+request_timeout_s = 10.0
+# The OUTER loop. Inside one attempt there is already a 3-attempt burst with
+# min(2*n, 5) backoff; this is the slower loop around the whole reconcile. While
+# it runs the process is alive, bound, serving /status and /kill, and NOT halted
+# — the scheduler has not started, so a success needs nothing undone. Only the
+# exhausted budget halts (process start) or aborts the day (per-session).
+#
+# 30 min at 60s: covers a cert outage of realistic length (2026-08-26's was ~33
+# seconds) while a permanently broken deployment still reaches a loud terminal
+# state the same morning instead of retrying into the weekend. At the per-day
+# site it also leaves most of the 10:00-15:00 entry window intact.
+retry_interval_s = 60.0
+retry_budget_s = 1800.0
+
+[marketdata]
+# Where MARKET DATA comes from — independent of where ORDERS go (`environment`).
+# Sandbox quotes are 15-min DELAYED: fine for mechanics, useless for judging
+# signal quality. "live" reads real-time quotes/instruments READ-ONLY from
+# production while orders still route per `environment` (cert).
+#
+# Reading live market data is NOT trading live — no orders, no positions, no
+# money at risk — and the session layer refuses to hand a market-data session to
+# account or order code. But it DOES need its own live registration:
+# TASTYTRADE_MARKETDATA_LIVE_CLIENT_SECRET / TASTYTRADE_MARKETDATA_LIVE_REFRESH_TOKEN.
+# source = "sandbox"
+source = "live"
+
+[coa]
+# Cboe Complex Order Auction timing for SPX. Two SEPARATE figures, because Cboe
+# publishes and changes them separately:
+#
+#   response_window_ms      how long the auction solicits responses
+#   extended_processing_ms  how much LONGER the exchange may take to finish
+#                           processing what came back
+#
+# The price-walking loop holds each price for BOTH combined (1000ms here) before
+# concluding "not filled, step the price". Cancelling at the end of the response
+# interval alone races a straggler response the exchange is still processing —
+# the cancel and a fill cross, and you hold a position you thought you walked
+# away from.
+#
+# These values were the moving target the spec warns about (100ms -> 250ms ->
+# 500ms, with an extended allowance renewed repeatedly against a sunset date).
+# SR-CBOE-2025-074 settled it: accelerated approval ~2026-03-30, no live sunset.
+# Still config, not literals — a settled parameter is not a permanent one.
+response_window_ms = 100
+extended_processing_ms = 900
+source = "SR-CBOE-2025-074, SEC accelerated approval 2026-03-25 — permanently removed the sunset provision, authorizing the 900ms extended-processing allowance for non-FLEX classes with no expiration. Re-verified against Cboe's published SPX/SPXW COA/AIM auction timing configuration 2026-09-11: response_window_ms = 100 (auction response interval) and extended_processing_ms = 900 (NIC/matching-engine processing allowance, capped at 1000ms total) are correct as configured."
+
+[risk]
+# Conservative caps for an unproven strategy. THREE size rails, all enforced, and
+# the tightest one for the trade actually in hand governs (config.RiskConfig):
+#
+#   position_size_pct           relative bound, 2% of NLV
+#   max_loss_per_position       absolute USD bound on one position's defined risk
+#   max_contracts_per_position  absolute contract bound on one position
+#
+# Why all three rather than just the percentage: 2% of NLV is $1,250 only at an
+# NLV of exactly $62,500, so before chunk 5 the decided per-trade cap was a
+# coincidence of account size rather than a stated limit — it moved every time the
+# account did. The percentage is kept as the additional non-binding sanity bound
+# it always was (it scales down with a drawdown, which the absolute caps do not).
+# RAISED 1740 -> 2500 on 2026-08-13, as one half of the two-spread decision below.
+# It is deliberately EXACTLY max_loss_per_position x max_concurrent_positions
+# (1250 x 2), so the day's worst case cannot exceed the day's stated budget. That
+# equality is the invariant to preserve: the breaker only stops NEW entries and
+# cannot close what is already open, so if concurrent x per-position were allowed to
+# exceed this, the breaker could trip having already authorized more risk than it
+# exists to cap. Move any of the three and re-check the other two.
+# 1050 since v0.5.2, synced with live (as C1 synced it down): the cutover must
+# not change what a day may cost. See argus.live.toml for the reasoning.
+daily_max_loss = 1050.00
+# SPREADS, not legs. Until 2026-08-13 the gate compared this against the broker's
+# LEG count, so "2" permitted exactly ONE vertical — 402 of 404 gate decisions that
+# day were denied on concurrent_limit. The gate now counts spreads
+# (ceil(broker_legs / 2)), still BROKER-derived.
+#
+# SET TO 2 BY RICHARD ON 2026-08-13, signed off FOR CERT/SANDBOX ONLY, with
+# daily_max_loss raised to 2500 in the same edit to keep the rails coherent.
+# The reason is measurement validity, not appetite: the shadow record was read
+# assuming TWO concurrent spreads, so running one vertical would have made the
+# live-fire results non-comparable with the analysis they are meant to test.
+#
+# What sandbox still cannot referee: daily_pnl is structurally 0 in cert (live-fire
+# pass, Finding 2), so the breaker does not actually enforce the 2500 here — the
+# equality above is arithmetic, not something this environment has exercised. Both
+# the breaker feed AND this exposure level need real validation before live.
+max_concurrent_positions = 2
+position_size_pct = 0.02
+# Absolute per-position rails. Independent of each other on purpose: a dollar cap
+# and a contract cap disagree about which trade is too big as soon as credit or
+# strike distance moves, so both are checked and the more restrictive one wins.
+# Must be <= daily_max_loss, or it could never bind before the breaker does.
+# Coupled to signal.max_width the other way: raise this without re-deriving
+# max_width and max_width silently becomes the binding constraint instead of
+# this rail. Move one, re-check the other.
+# → docs/decisions/2026-09-02-third-live-fire-day.md
+max_loss_per_position = 475.0
+max_contracts_per_position = 1
+
+# THE SIDE-BALANCE RULE (v0.5.2, 2026-09-26). A new spread may open only on a side
+# that leaves |puts - calls| <= max_side_imbalance, and among the sides that qualify
+# on a tick the one leaving the book more balanced goes first (ties in signal.sides
+# order: put first). At two slots and 1 that is AT MOST ONE OPEN SPREAD PER SIDE.
+# Chosen in the orchestrator, re-checked by the gate (side_imbalance_exceeded).
+# Counted per side exactly as the concurrency cap counts in total (per trade idea,
+# broker legs by right, working opening orders). side_balance = false is the
+# pre-v0.5.2 entry path exactly, and the config-only rollback.
+# -> docs/designs/2026-09-26-multi-spread-side-balance.md,
+#    docs/decisions/2026-09-26-one-position-per-side.md
+side_balance = true
+max_side_imbalance = 1
+
+[staleness]
+# Fail-closed gate tolerances. Quotes need a tight bound — they drive pricing and
+# should stream continuously, so a gap really is staleness (§5).
+market_data_max_age_s = 2.0
+# Greeks are NOT quotes, and until 2026-08-27 they shared the bound above.
+#
+# That line is an argument about PRICES, and it is right about prices. Delta is not
+# one. It is read in exactly one place — the min() in strategy._select that picks
+# the short strike — and contributes nothing to the credit, the width, the max
+# loss, the sizing, the gate, or the walk's limit; every one of those comes off a
+# quote still held to 2.0s. 2026-08-24 split which FIELDS a leg must clear for
+# which ROLE and deliberately kept one number. Measurement said the number was the
+# problem: the greeks feed refreshes the whole chain in synchronised bursts with
+# gaps of median 137s and p90 421s, so at 2.0s a short strike was selectable on
+# 2.8% of in-window ticks — 550 of 565 reported no_short_leg_with_fresh_delta with
+# the ladder fully priceable throughout.
+#
+# What a stale delta costs is ONE number. At gamma ~0.0075 delta/pt on a 0DTE
+# 15-delta SPX strike, one 5-point strike is 0.0374 of delta, so a 120s-old reading
+# moves the SELECTION by 0.46 of a strike at 1 sigma and cannot mis-price anything.
+# Set that against a target_short_delta that is itself an uncalibrated tuning knob.
+#
+# Deliberately NOT sized to cover the p90 gap: that needs ~420s, costing 0.86 of a
+# strike at 1 sigma and 2.6 at 3 sigma. The tail is what a drift-based bound is for
+# (gamma x |spot moved since capture| — correct on a quiet tape AND a fast one,
+# where no timer is either). This is the interim; signal.candidate now records
+# short.greeks_age_s and signal.none records min_greeks_age_s, and that is the
+# dataset the drift tolerance gets sized from.
+#
+# NOT cert-only, unlike account_stream_max_age_s below: [marketdata] source is
+# already "live", so this burst cadence is the production feed's own behaviour and
+# this number is the right one in live too.
+# → docs/decisions/2026-08-24-entry-leg-admission-is-role-scoped.md
+greeks_max_age_s = 120.0
+# Account state is different: the AlertStreamer pushes only on CHANGE, so a flat,
+# quiet account emits nothing for long stretches. account_refresh_s is the
+# liveness floor — a periodic REST re-seed proving the link is alive — and must
+# stay below the max age. The looser tolerance is safe because when account state
+# actually matters (positions open) the stream pushes marks continuously; the
+# quiet case is precisely when there's no position risk to be late on.
+#
+# RAISED 30 -> 120 on 2026-08-27, and this one IS SANDBOX-ONLY. Cert's /positions
+# times out often enough that the liveness re-seed cannot stamp the stream at all:
+# 245 failures across 48 outage episodes in one session, worst outage 92.6s, and
+# every one of that day's 8 gate denials was account_stream_stale ALONE. That is a
+# cert artifact; live has no equivalent. The paragraph above is what makes it
+# tolerable rather than merely convenient — the book was flat throughout, and the
+# one field here that carries real information (the concurrent-spread count) has a
+# second live source that does not depend on this stream: open_spread_equivalent
+# takes the HIGHER of the broker mirror and the LEDGER count.
+#
+# config.py REFUSES environment = "live" above LIVE_MAX_ACCOUNT_STREAM_AGE_S (30.0)
+# rather than trusting this comment — a cert-only widening of a fail-closed rail is
+# exactly the thing that rides into live by being forgotten.
+account_stream_max_age_s = 120.0
+account_refresh_s = 10.0
+# Per-attempt bound on the REST re-seed. The broker's cert API returns 502s and
+# hangs often enough that this matters: without it a single stuck request runs to
+# the HTTP client's own default and the retry never gets a turn. Must stay below
+# account_refresh_s.
+# TWO call sites since 2026-08-21, not one: this is THE per-attempt bound for a
+# fetch_positions() round trip wherever one is awaited, and the second is the
+# watchdog's book-confirm, which awaits INSIDE a check_once pass — so raising this
+# raises the watchdog's worst-case blind window (no position evaluated against its
+# triggers) by the same amount.
+# → docs/decisions/2026-08-21-book-confirm-timeout-bound.md
+account_refresh_timeout_s = 5.0
+# How long a cached position absent from every REST snapshot must go untouched
+# before the re-seed drops it. A closed position is OMITTED from the snapshot, not
+# reported flat, so absence is the only evidence — and the broker's book trails a
+# fill by ~4-5s, so absence alone is not enough. 60.0 is ~12x that lag and 6x the
+# refresh interval: a real position is re-touched every 10s and can never reach it,
+# a ghost climbs past it inside a minute. Must be > account_refresh_s.
+# → docs/decisions/2026-08-19-account-cache-ghost-positions.md
+account_position_evict_after_s = 60.0
+
+[audit]
+db_path = "argus.db"
+
+# SQLite durability. NOT hardcoded, because the right answer differs by phase.
+#
+#   NORMAL  fsync only at checkpoint. WAL still guarantees NO CORRUPTION, and a
+#           plain process crash is safe (the page cache outlives it). What it
+#           risks is a HOST-level unclean shutdown — droplet hard reset,
+#           hypervisor failure, kernel panic — rolling back the last commits.
+#   FULL    fsync on every commit; durable before COMMIT returns.
+#
+# Measured on the Docker volume, single-record commits (the Tier 1 pattern):
+#   NORMAL  p50 0.009ms   p99 0.024ms
+#   FULL    p50 0.081ms   p99 1.86ms
+# The write rate that cost is measured against — MEASURED, and it has moved:
+#   ~0.6/s   shadow sessions, the original basis for this comment
+#   ~1.7/s   2026-08-13, the first live-fire session, PRE-Fix-C
+#   2.33/s   2026-08-18, post-Fix-C — but only 0.20/s of it is TIER 1
+#   1.52/s   2026-08-19 — 0.25/s of it Tier 1, both over the same 6.33h
+#   2.26/s   2026-08-31 — 0.23/s of it Tier 1, over the same 6.33h, TWO positions
+#            watched all session (5,308 Tier 1 / 46,138 Tier 2). The honest number
+#            to cite is ~2.3 records/sec, Tier 1 alone ~0.2/s.
+#
+# ONLY TIER 1 PAYS THE FSYNC, and that is the number to read here. The 2026-08-18
+# session wrote 4,651 Tier 1 and 48,411 Tier 2 records over 6.33h: total volume
+# ROSE against 2026-08-13 while the cost fell, because Fix C re-levelled the
+# evaluability flap from Tier 1 (1,517 awaited `watchdog.unevaluable` writes) to
+# Tier 2 `watchdog.degraded` (2,954, queued). The pre-fix prediction that the rate
+# would drop was right about the tier that matters and wrong about the aggregate.
+#
+# DO NOT READ THESE AS A TREND — the rate scales with POSITIONS WATCHED, not with
+# time. `watchdog.check` is per position per tick and dominates the total, so
+# 2026-08-19 came in LOWER (24,821 ticks vs 43,104) purely because a stale-cache
+# phantom pinned the concurrent limit and only one position was watched for most
+# of the day. Two positions all session is the number to size against, and 2.33/s
+# is the honest high-water mark. 2026-08-31 CORROBORATES it from the case the
+# comment says to size against — two positions watched all session, 37,965
+# `watchdog.check` ticks, 2.26/s total and 0.23/s Tier 1. Cite ~2.3 records/sec.
+#
+# At 0.20-0.25 Tier 1 records/sec, FULL costs roughly 16-20 MICROSECONDS per second
+# of runtime. The latency argument for NORMAL does not survive contact with that at
+# any of the numbers above, and the p99 only bites if a whole second's worth
+# of writes land inside one.
+#
+# Re-measure with (read-only, safe mid-session; prints the rate split by tier):
+#   ./.venv/bin/python -m argus.tools.evaluability --config argus.sandbox.toml
+#
+# Why it matters beyond forensics: the audit DB also holds the `positions` table
+# that reconciliation compares the broker against on restart. Losing the tail
+# means reconciling against expected state that is quietly missing the most
+# recent entry — either a false mismatch that blocks the open, or a "clean"
+# reconcile against a position the record has forgotten.
+#
+# `environment = "live"` is REFUSED unless this is FULL (or EXTRA) — config.py
+# enforces it, so live cannot inherit shadow's weaker setting by omission.
+# Shadow submits nothing and holds nothing, so NORMAL is defensible here.
+synchronous = "FULL"
+
+# Tier 2 telemetry queue is bounded and alerts before it fills (spec §6).
+tier2_queue_maxsize = 10000
+tier2_queue_alert_depth = 7500
+
+[heartbeat]
+# Event-loop-lag early warning (spec §4, §9). interval is how often it wakes;
+# lag_alert_threshold_s is how late a wakeup may be before it's a breach.
+interval_s = 0.1
+lag_alert_threshold_s = 0.05
+sustained_breach_count = 5
+# §11 open question (Richard): whether a sustained stall trips the fail-closed
+# halt like stale data does. Default alert-only until decided.
+#
+# !! DO NOT SET THIS TRUE AS THE CONFIG STANDS. It would halt trading every
+# !! morning, permanently, and it reviews as a one-word edit.
+#
+# MEASURED on the droplet, twice, 2026-08-05 (11:15:50 and 11:47:54): subscribing
+# the 120-contract 0DTE chain to DXLink (quote+greeks) blocks the event loop for
+# ~0.45-0.55s, at every session start. The breach alert lands 2ms before the
+# "subscribed to 120 symbol(s)" line, which is what identifies it.
+#
+# At interval_s = 0.1 the heartbeat catches up by burning ticks, so a 0.5s stall
+# is ~5 consecutive breaches — i.e. it reaches sustained_breach_count = 5 on
+# EVERY session start. With this flag true, app.Application._trip_on_stall would
+# then engage the kill switch at ~09:40 daily. And the kill switch is
+# PROCESS-lifetime and deliberately survives day rollover (a rollover must never
+# un-halt), so it would not clear at the next open: entries refused all day, every
+# day, until a human restarts the process.
+#
+# The stall itself is benign where it happens — warmup, before the signal loop
+# starts, nothing held and nothing working at the exchange. It is only the
+# threshold that is wrong for it.
+#
+# Two prerequisites before flipping this, either of which is sufficient:
+#   1. Move the chain subscribe off the event loop, or
+#   2. Raise sustained_breach_count above what warmup produces (measure first —
+#      it scales with chain size, so strike_window_points changes it).
+trip_on_sustained_stall = false
+
+[signal]
+# Baseline credit-spread parameters — shadow-mode TUNING KNOBS, not a validated
+# edge (spec §8, §11). Calibrate from shadow data; Richard owns these values.
+sides = ["put", "call"]      # which verticals to consider
+target_short_delta = 0.15    # short strike delta magnitude
+width = 5.0                  # DESIRED spread width in points
+# Hard cap on actual strike distance. Ladders have gaps, so the long leg is the
+# nearest quote-fresh strike in [width, max_width]; this bounds the extra risk that
+# allows. Coupled to risk.max_loss_per_position via SpreadSignal.max_loss_per_contract
+# = (w - credit) x SPX_MULTIPLIER: at 475 a spread fits only if w <= 4.75 + credit,
+# about 5.25 points at the 0.50 floor, so NOTHING wider than `width` can open.
+# 5.0 since 2026-09-28 (was 10.0, set for 1 x 950): a stale or gapped 5-point long
+# now reads `no_long_leg_within_max_width` instead of proposing a 10-wide the gate
+# must refuse. That refusal took the tick on an empty book, where the side rule
+# ranks before the gate, and on 2026-09-24 it spent the day's budget page. No risk
+# change. Raise max_loss_per_position first, then re-derive this.
+# → docs/decisions/2026-09-02-third-live-fire-day.md,
+#   docs/research/2026-09-28-objective-audit-due-diligence.md (P12)
+max_width = 5.0
+min_credit = 0.50           # minimum net credit (points) to accept
+entry_earliest = "10:00"    # ET — no entries before
+entry_latest = "15:00"      # ET — no entries after
+cadence_s = 5.0             # how often the loop evaluates
+# WHICH delta chooses the short strike (2026-09-21). "mid": the delta implied by
+# each out-of-the-money leg's OWN MID — the same quotes the credit is computed
+# from, so `min_credit` stops selecting strikes the feed under-states (the five
+# live call entries of 2026-09-21 were ~0.19 delta, not 0.15). "feed": the greeks
+# feed's delta, the pre-2026-09-21 behaviour. REQUIRED, no default. Switching
+# back to "feed" IS THE ROLLBACK — a config-only release, after the close, never
+# mid-session with a position open. Changing it changes which strike is traded;
+# never pool call outcomes across the change (split on `delta_source`).
+# → docs/decisions/2026-09-21-short-strike-selection-on-mid-implied-delta.md
+short_delta_source = "mid"
+
+[execution]
+# How stale a candidate may be when its ORDER IS BUILT — measured from the chain
+# snapshot the candidate came from. This catches a pipeline stall between the
+# pre-trade gate passing and the order being constructed, WITHOUT refetching a
+# quote: a refetch would submit a different price than the one that was sized and
+# gated (spec §7), and would add a round trip on the latency-critical path.
+#
+# It bounds a much shorter window than staleness.market_data_max_age_s (which is
+# about the feed's own health), so keep it well inside that value — the loader
+# refuses a value larger than it, since the gate would block on the looser
+# threshold first and this check could never fire.
+signal_max_age_s = 1.0
+
+# -- price-walking loop (spec §7) ---------------------------------------------
+#
+# !! SANDBOX-ENTRY VALUES, chosen by Richard 2026-08-10 — NOT final live-scale
+# !! values. entry_cadence_s / entry_step_ticks / entry_walk_away_pct /
+# !! entry_drift_abort_points are live-money strategy parameters: they decide how
+# !! much credit an entry gives up chasing a fill. The reasoning for each is in
+# !! walk_source below and in docs/execution-watchdog-parameters-2026-08-10.md.
+# !! A second, DATA-BACKED pass is planned before size is scaled — tune from the
+# !! walk.finished outcome mix once live-fire telemetry exists, and update
+# !! walk_source in the same edit. Never change a value here without it.
+#
+# entry_cadence_s: how long one price is held before repricing. Spec §7 suggests
+# 3-5s for entries (exits run faster — chunk 4 supplies its own policy). Raised
+# to the COA settle window (response_window_ms + extended_processing_ms) if set
+# below it; the loop will never cancel inside the auction.
+entry_cadence_s = 4.0
+# Ticks conceded per reprice step. 1 tick = $0.05 on SPX (spec §7's example).
+entry_step_ticks = 1
+# Fraction of the original limit's magnitude the walk may concede before
+# abandoning. 0.10 on a $0.85 credit stops at $0.75. Spec §7's illustration is
+# "10% of max profit" — an illustration, not a recommendation.
+entry_walk_away_pct = 0.10
+# POINTS of underlying movement away from the price the candidate was gated at
+# that ABANDON the walk (outcome `drifted`, distinct from `walked_away`). The
+# ladder never re-quotes — it steps from the gate-approved mid — so this is the
+# circuit breaker that stops it offering prices derived from a market that has
+# moved on. At 10-15 delta a 2-3 point SPX move inside a 20-30s walk is worth a
+# large fraction of a $0.65 credit. Sized like the three above: too tight abandons
+# entries on ordinary noise, too loose is a check that never fires. 3.0 was checked
+# against a VIX~15 sqrt-time estimate (~1.1-1.2 sigma over a 20-30s walk) — NB it
+# is a FLAT constant, so at VIX 25 it is sub-1-sigma and stops filtering noise.
+entry_drift_abort_points = 3.0
+# Provenance, required and refused if blank — same rule as coa.source. This is
+# what makes who-chose-these-and-why a fact in the deployed config rather than a
+# comment somebody edits around. It must move with the values above.
+walk_source = "SANDBOX-ENTRY values, chosen by Richard 2026-08-10. NOT final live-scale values — a second, data-backed pass is planned before scaling size. entry_cadence_s=4.0 and entry_step_ticks=1 match commercial options Walk-Limit convention (2-60s hold range, $0.05 min tick) and spec §7's 3-5s guidance; 1 tick is the minimum possible concession, the conservative end. entry_drift_abort_points=3.0 checked against a VIX~15 sqrt-time estimate (~2.2-2.7pt 1-sigma over 20-30s, reproducing the original in-file estimate) = ~1.1-1.2 sigma, so it should not fire on ordinary noise; NB it is a FLAT constant and at VIX 25 the same estimate gives ~3.6-4.4pt, i.e. sub-1-sigma, so in a vol spike it stops being a noise filter — revisit if [regime] is ever armed. entry_walk_away_pct=0.10 is the one to watch: MEASURED against Argus's own shadow record, 84% of candidates (63/75, median credit 0.525) get exactly ONE $0.05 reprice before the floor, 16% get two. Combined with entry.py's one-attempt-per-candidate_id rule, a walk-away RETIRES that strike pair for the process lifetime rather than re-proposing it. Tune from walk.finished outcome mix once live-fire telemetry exists. See docs/execution-watchdog-parameters-2026-08-10.md."
+
+# How long to wait for a submitted order to reach a status confirmed to mean
+# "working at the exchange" before cancelling it. Bounds the case chunk 1
+# measured against sandbox: a pre-market submission is accepted, carries
+# `tif.next_valid_session`, and sits at `Received` outside the market. Such an
+# order MUST be cancelled — left alone it goes live at the next open, unattended.
+working_timeout_s = 30.0
+# How often to poll that status. Operational only: it trades request volume
+# against how fast a transition is noticed, and touches no price.
+status_poll_interval_s = 1.0
+# Consecutive broker failures one walk tolerates before it gives up and reports
+# UNRESOLVED. A mid-session disconnect is recovered here (reconnect + re-query),
+# never escalated to a process halt — reconciliation is a restart-time rail.
+max_recovery_attempts = 3
+# Process-wide CEILING on order requests per second — insurance against a runaway
+# loop, not a cadence input. tastytrade support confirmed 40 req/s per IP on
+# /orders (2026-07-29); designed volume is under 1/s, so this should never bind.
+max_order_requests_per_second = 40.0
+# THE duplicate-submission guard's own bound, and how many blind trade ideas in a
+# row end the day. Added 2026-08-26 after a single cert timeout on
+# has_conflicting_order ended a whole trading day on its very first tick (10:00:00
+# ET, ~5 hours of entry window lost, no order ever at risk).
+# → docs/decisions/2026-08-26-entry-guard-unreachable-retry.md
+#
+# guard_timeout_s: ONE HTTP attempt at "is anything already working under this
+# identifier?". Deliberately NOT broker.http_timeout_s (30s) — the same reasoning
+# [reconcile] request_timeout_s already refuses it for, and it bites harder here:
+# httpx reads a scalar timeout as connect/read/write/pool INDEPENDENTLY, so the
+# inherited bound was ~30s connecting PLUS ~30s reading, on the path whose
+# candidate was built against signal_max_age_s = 1.0. Tighter than the reconcile's
+# 10.0 because the reconcile runs once a session while this runs per trade idea
+# and every second is unchecked price staleness on the walk's first rung (the one
+# rung entry_drift_abort_points never checks). 3.0 is UNMEASURED — a healthy
+# GET /orders on a warm session should be well under it; a fast 502 or a refused
+# connection returns in milliseconds and never touches this at all.
+guard_timeout_s = 3.0
+# Consecutive EXHAUSTED bursts (3 attempts, 1s/2s backoff) before ending the day.
+# Counts DISTINCT trade ideas, never ticks: a failed candidate is already in
+# `_attempted`, so the next tick re-proposing the same strikes never reaches the
+# guard. 3 therefore means "three different spreads in a row could not be checked"
+# — sustained blindness, which is the condition the original stand-down was for.
+# Every single failure still pages immediately; this only decides when the DAY
+# ends. Set to 1 to restore the pre-2026-08-26 behaviour exactly.
+guard_unreachable_max_streak = 3
+
+# ACTIVATION MODE for the entry path (chunk 5). true runs the ENTIRE pipeline —
+# gate -> duplicate guard -> order construction -> audited/throttled stack -> the
+# broker — but sends the broker's own dry_run=True, so nothing is routed. It is how
+# the wiring gets verified end-to-end before the first live-fire sandbox order.
+#
+# It deliberately stops after the dry-run submit rather than price-walking: a dry
+# run returns NO order id (measured against sandbox, chunk 1), so there is nothing
+# for the walk to poll, reprice or cancel. A dry run proves construction, layering,
+# the guard call and that the broker accepts the payload — it proves NOTHING about
+# fills, repricing or timing.
+#
+# Absent defaults to TRUE (fail-closed: an old config must not start routing real
+# orders just because `environment` was flipped). Set false as a deliberate,
+# reviewable line when the dry-run pass has been read and understood.
+dry_run_submissions = false
+
+[watchdog]
+# Position risk watchdog + exit handoff (spec §4, §7 exit variant, §8).
+#
+# The watchdog is a SEPARATE task from the signal engine — spec §4: "gamma risk in
+# the final hour doesn't care whether entry logic is running" — so its parameters
+# live here rather than under [execution], which is about order mechanics.
+#
+# !! SANDBOX-ENTRY VALUES, chosen by Richard 2026-08-10 — NOT final live-scale
+# !! values. credit_multiple / underlying_buffer_points / sustained_s are
+# !! live-money strategy parameters: they decide when a losing position is closed,
+# !! and spec §8 notes that this virtual stop is precisely what should keep
+# !! realized losses well under the theoretical max-loss column. The reasoning for
+# !! each is in trigger_source below and in
+# !! docs/execution-watchdog-parameters-2026-08-10.md. A second, DATA-BACKED pass
+# !! is planned before size is scaled; validate underlying_buffer_points by
+# !! watchdog.exit_unpriceable / watchdog.unwatchable frequency during wide-quote
+# !! episodes, NOT by trigger rate on an ordinary day. Never change a value here
+# !! without updating trigger_source in the same edit.
+
+# How often open positions are re-evaluated against the triggers. Pure in-memory
+# quote arithmetic — no database, no broker call.
+cadence_s = 1.0
+# How often the watch list is REBUILT from the order ledger. Deliberately far
+# slower than cadence_s: that read runs on the audit log's writer connection under
+# the chain lock (AuditLog.read), the same lock a crash-critical Tier 1 write
+# takes, and that lock's contract is "reads are rare, never an automated hot
+# path". Chunk 5 wires the fill consumer to PositionWatchdog.request_refresh() so
+# a newly-filled position is picked up immediately rather than up to this late.
+refresh_interval_s = 15.0
+# How long a `booked_but_absent` book disagreement (broker holds FEWER legs than
+# the ledger) may persist before it pages. ONE DIRECTION ONLY as a blanket timer —
+# `held_but_unbooked` is the dangerous one (a real position nobody is watching) and
+# never waits on a clock alone.
+#
+# Since 2026-08-20 this value ALSO bounds how long Argus's own closing-fill record
+# stays admissible as the evidence that suppresses a `held_but_unbooked`
+# disagreement. Same physics running the other way: on the way OUT the ledger
+# deletes the position row the instant the closing fill books and the broker's book
+# trails it (measured: fired 1.215s after the fill, cleared 6.012s later). That
+# direction is EVIDENCE-gated, not time-gated — no matching recent closing fill on
+# the legs in disagreement means it pages immediately and unconditionally, which is
+# the case a blanket timer would have wrongly suppressed.
+# → docs/decisions/2026-08-20-held-but-unbooked-after-our-own-exit.md
+#
+# Why this exists: the 2026-08-13 live-fire pass produced a booked_but_absent
+# disagreement on EVERY entry — 0 vs 2 and 1 vs 2 legs — because Argus books an
+# AlertStreamer fill before the broker's own position book reflects it. Both
+# resolved on their own, in 5.01s and 4.01s. Without an allowance that is one ERROR
+# page per entry for ordinary propagation lag, which is the 2026-08-05 alert-storm
+# shape all over again: a real signal made audible at the wrong threshold.
+#
+# 20.0 is ~4x the observed lag and above refresh_interval_s, so a full ledger
+# refresh can elapse inside it even with no fill-driven request_refresh(). The
+# suppressed episodes still leave a Tier 2 trail (watchdog.book_disagreement_still,
+# then watchdog.book_settled with the duration) — re-tune this from those records,
+# not from a guess. 0 disables the allowance and restores the instant page.
+book_settle_s = 20.0
+# How long ONE REST book-confirm verdict may be reused for the same
+# (broker_legs, ledger_legs) shape before it is re-measured. Measured from when the
+# verdict was taken; a cache hit does NOT extend it.
+#
+# The confirm is the REST round trip that decides whether a held_but_unbooked
+# disagreement is a real unwatched position or just account-cache drift. Two
+# stronger invalidations come first and need no number — the cache is cleared
+# outright the moment the book agrees, and a verdict only ever answers for the exact
+# leg counts it was measured against. This is the backstop for what neither can see:
+# the same counts recurring inside one long disagreement episode for a DIFFERENT
+# reason, where a stale True suppresses the one page that has no allowance.
+#
+# 90.0 is bounded on both sides and both bounds are real:
+#  - It must exceed refresh_interval_s (15.0) or a verdict expires before it can
+#    ever be reused, which is a REST round trip — and a blind window with no
+#    position evaluated against its triggers — on every observation. The loader
+#    refuses a value at or below it.
+#  - 90 also clears the account cache's own repair path end to end:
+#    account_position_evict_after_s (60) + one account_refresh_s (10) + one
+#    refresh_interval_s (15) = 85s for a genuine ghost to be evicted, the counts to
+#    move, and the watchdog to see it. Expiring sooner re-confirms verdicts the
+#    eviction was still on track to make irrelevant.
+#  - It is the cap on how long a suppression may stand on an old reading. Before
+#    this key there was NO cap — one verdict held for the whole episode, which on
+#    2026-08-19 was over an hour.
+# Re-tune from watchdog.book_cache_over_reporting frequency, not from a guess.
+# → docs/decisions/2026-08-21-book-confirm-cache-is-per-shape-and-expires.md
+book_confirm_ttl_s = 90.0
+
+# Trigger 1 (dominant): exit when the cost to CLOSE reaches this multiple of the
+# credit received — i.e. 2.0 exits at a loss equal to the credit collected, the
+# well-established convention for this strategy shape. Must be > 1: at 1.0 the
+# trigger fires at break-even, which is an immediate exit rather than a stop.
+credit_multiple = 3.0
+# THE STRIKE-TOUCH STOP (v0.5.2, 2026-09-26): the credit trigger above does NOT
+# fire. The emergency exit is the underlying trigger alone, at buffer 0 (below):
+# spot reaching the SHORT STRIKE, held sustained_s. credit_multiple stays set and
+# credit_stop is still computed and recorded (the profit target and the blind page
+# share its input), so true here is the config-only rollback to the credit stop.
+# The replay: +$49-71/day against the 2x stop over 24 sessions, both folds, both
+# marks, robust to slippage; better in 3 of 4 path models, tail no worse in any.
+# -> docs/decisions/2026-09-26-strike-touch-stop.md
+credit_trigger_enabled = false
+# Trigger 2 (backstop): exit when the underlying comes within this many points of
+# the SHORT strike. It fires on the thing that actually causes the loss and keeps
+# working when the option market is too wide to price, which is exactly when the
+# credit trigger is least reliable. 0 means "when the strike is touched".
+# 0.0 since v0.5.2 (2026-09-26): the strike-touch stop, see credit_trigger_enabled.
+underlying_buffer_points = 0.0
+# DEBOUNCE, not a delay (spec §7: sustained for several consecutive seconds). A
+# 0DTE vertical's mid can print through 2x credit on one wide quote and come
+# straight back; acting on that single observation turns a quote artifact into a
+# realized loss. Must be >= cadence_s or a single observation satisfies it.
+sustained_s = 5.0
+
+# -- exit walk (chunk 3's PriceWalkingLoop, exit parameterization) -------------
+#
+# Spec §7: the exit hands off to the SAME price-walking loop on a faster cadence
+# (~1s vs 3-5s for entries). Floored at the COA settle window like any other
+# cadence — at 1.0s here it sits exactly on that floor, which is intended.
+exit_cadence_s = 1.0
+exit_step_ticks = 1
+# How much MORE than the mid the exit will pay before giving up and crossing the
+# market. On a -1.70 debit, 0.20 walks to -2.04 before abandoning.
+#
+# HELD at 0.20 by the 2026-09-17 second pass, deliberately rather than by default. It
+# governs ONLY the credit-stop regime — all 23 credit-stop exits in the 2026-09-14 cert
+# backup opened at 0.95 or above, so everything below |0.75| is exit_walk_min_steps'
+# business — and nothing in that regime is broken: every credit-stop exit that filled did
+# so at step 0, 1 or (once, 2026-08-13) 4, inside the 4-8 rungs this provisions. An
+# UNREACHED rung is free, so narrowing buys nothing and would cost the one 4-step fill.
+# Lowering to 0.10 would halve the range on cert FILL evidence whose bias runs the wrong
+# way (see exit_walk_min_steps). Widening toward the width is the principled direction
+# and is NOT a value tweak — it is the functional-form change recorded as owed.
+#
+# THE WIDTH CAP IS MISSING HERE AND IT HAS FIRED. _cross_limit caps at min(debit, width);
+# PriceWalk does not, and neither does _limit_price, which refuses only a non-positive
+# price. On 2026-09-03 at 15:37:59 ET, after the manual restart,
+# argus-close-20260903-call-7725-7730 (width 5.00) opened at -5.05 with a floor of -6.05
+# (20 rungs) and FILLED at step 0 at -5.05 against an entry credit of 0.70, realizing
+# -870.00. Holding to settlement pays the width: (0.70 - 5.00) x 2 x 100 = -860.00, so
+# the flatten did $10 WORSE than doing nothing — and the breach was at the OPENING LIMIT,
+# not the floor: a wide print on a deep-ITM spread marked above intrinsic and nothing
+# checked it. Capping both is a CODE change and is owed AHEAD of further tuning here.
+exit_walk_away_pct = 0.20
+# FLOOR under that percentage, in REPRICES. A percentage of a price on a tick grid
+# vanishes below half a tick: at 0.20 an exit opening at a debit of 0.05 or 0.10 gets
+# a walk-away floor equal to its own opening limit, so the walk offers the mid once
+# and escalates straight to the market cross. That is not a tail — a winning 0DTE
+# spread is nearly worthless by 15:30, which is the whole reason it is winning, so it
+# is the FLATTEN'S MODAL REGIME. On 2026-08-31, P2's first fire, both spreads walked
+# away "after 0 step(s) at -0.05" and the entire outcome of both flattens rode on a
+# single instantaneous crossing limit; one found an offer, one did not and spent the
+# position's only attempt in 1.3 seconds.
+#
+# STEPS, not ticks, so the guarantee survives exit_step_ticks being raised. Refused
+# at 0 — 0 is the defect.
+#
+# 3 since 2026-09-17, raised from 1, and this OVERTURNS the shipped reasoning rather
+# than extending it. That note called 1 "the UNIQUE value that changes the two broken
+# rows and no row that already works" — true at n=2, false at n=37. The 2026-09-14 cert
+# backup holds 37 watchdog.exit_started rows whose opening limits are BIMODAL with an
+# empty band between: 12 flatten exits at 0.05/0.10, 23 credit-stop exits at 0.95-1.95,
+# and NOTHING in between. The gap is arithmetic, not sampling — a credit stop opens at
+# credit_multiple x entry_credit = 2.0 x [0.50..1.00], a flatten opens at whatever a
+# nearly worthless winner is worth. So a floor of 3 or fewer steps binds only below
+# |0.75| and touches ONLY the 12 flatten rows: zero of the 23 credit-stop rows is under
+# 0.95, MEASURED rather than assumed. The old reasoning holds; its conclusion was
+# sample-limited.
+#
+# Why 3. The range is provisioned INVERSELY to the runway it has. Measured rung-to-rung
+# elapsed is 4-23s — not cycle_wait_s — so at 0.20 the flatten, with 1800s of runway,
+# gets ~8s of walking, while the credit stop, where gamma makes every second expensive,
+# gets 40-80s. And the flatten is the one regime where the ladder is the ONLY mechanism:
+# the cross needs a live offer and 2026-08-31 proved it can be absent
+# (CROSS_UNPRICEABLE, held to expiry at the full width). The asymmetry is ~90:1 — an
+# exhausted flatten ladder costs up to the width (~$900 at 2 contracts), an extra rung
+# costs $10 and only if REACHED. An unreached rung is free: the walk stops at the fill, a
+# limit walking the grid cannot skip a resting offer, and the cross is already capped at
+# the width, so a wider floor can only fill at or below what the cross would have paid.
+# CORRECTED 2026-09-25: that holds for a resting COMPLEX offer, not for a natural derived
+# from LEG quotes. On 2026-09-24 (long leg bid zero, so no leg-in exists) rungs at and
+# above a 0.10 natural went unfilled, and the cross then priced BELOW the ladder's end.
+# The cross now pays past the last rung only where the long leg has a bid; a far-OTM
+# flatten is deferred instead (flatten_deferral below).
+# -> docs/designs/2026-09-25-deferring-a-far-otm-flatten.md
+#
+# What the evidence does and does not support. min_steps=1 is PROVEN: 4/4 flatten exits
+# walked away at 0 steps before it, 0 of 5 after, and one used its rung (2026-09-09,
+# filled at step 1, -0.15). All 3 watchdog.crossed rows show the market exactly ONE tick
+# above the floor — a QUOTE fact, so cert-admissible — but n=3, one trigger, one regime.
+# 2 covers that plus one tick, 3 plus two; the choice is tail coverage in the regime with
+# the most runway and no backstop, not a fill measurement. 17/18 exit fills and 39/39
+# entry fills landed within ONE rung and that is NOT usable here: if cert fills too
+# easily it OVERSTATES how little concession is needed, so the bias runs against reading
+# it as "rungs past 1 are unnecessary". It shows only that they are rarely reached.
+#
+# Max floor at 3 on a 0.05 opening limit is 0.20 against a 5.00 width — nowhere near the
+# cap, and the cap is separately BROKEN (see exit_walk_away_pct above). Still a CONFIG
+# FLIP, not a deploy.
+# → docs/decisions/2026-09-17-exit-ladder-second-pass.md
+# → docs/decisions/2026-08-31-exit-ladder-near-tick.md
+exit_walk_min_steps = 3
+# Bounded wait for an ABANDONED exit order to actually go terminal before the
+# market-crossing order is sent. cancel() leaves an order at `Cancel Requested`,
+# not gone, and stacking a second closing order on one that can still fill would
+# close the spread TWICE — which does not flatten it, it re-opens it inverted and
+# unmanaged on expiry day. If it has not gone terminal by then the cross is
+# REFUSED and an alert fires instead.
+exit_cancel_settle_s = 3.0
+
+# How long a TRIGGERED position may sit with NO exit order in the market before a
+# second, louder page fires. Not a retry limit: both no-order paths
+# (watchdog.exit_unattempted — construction refused the quote or the price; and
+# watchdog.exit_unpriceable — the legs cannot be priced at all) go on retrying
+# every cadence tick forever, because giving up would strand an open 0DTE position
+# the watchdog has already decided must be closed, and burning its one attempt on
+# an order that was never sent would be worse. The retry was already right. The
+# SILENCE was not: escalation is rising-edge, so before 2026-08-20 these paged
+# once and then dropped to Tier 2 telemetry indefinitely.
+#
+# 30.0 = 30 cadence ticks. Sized as an ALERTING bound, not a strategy parameter
+# (same class as working_timeout_s): long enough that an ordinary few-second quote
+# gap resolves inside it without a second page, short enough that a triggered
+# position nobody can close is on a phone while the trading day is still running.
+#
+# It REPEATS every interval for as long as the condition holds — deliberately, and
+# not the same thing as a storm. A once-only page is one missed notification away
+# from restoring the silence this key exists to prevent, which is the wrong side to
+# err on for "an open 0DTE position cannot be closed". The rate is bounded twice:
+# per INTERVAL rather than per cadence tick here, and per KIND at 900s inside
+# SlackNotifier, which folds the rest into a "(+N suppressed)" count. So this value
+# sets how often the audit trail restates it, and the phone sees roughly one message
+# per 15 minutes carrying the count. There is no "off" — 0 is refused.
+exit_unattempted_max_s = 30.0
+
+# Trigger 3 (the desk control): flatten every held spread this many seconds before
+# THIS DAY'S close, regardless of price. 1800.0 = 15:30 ET on a normal session and
+# 12:30 ET on a half-day.
+#
+# An OFFSET, never an absolute time, and that is the whole reason it is expressed
+# this way: a literal 15:30 falls two and a half hours AFTER a half-day's 13:00
+# settlement, so the control would simply never fire on the compressed sessions it is
+# most needed on. The offset is applied to MarketCalendar.close_time(d), the same
+# object and the same reasoning that already anchors settlement_mark — "never a
+# literal 16:15, which is wrong on a half-day" (2026-08-25).
+#
+# Why it exists at all. The other two triggers are both PRICE triggers, and they
+# share a dependency the strategy cannot rely on at the one moment it matters. On
+# 2026-08-28 the credit stop fired at 10:37, the exit was refused by an unreachable
+# broker, and the position sat held and triggered for 76 minutes — the thing that
+# costs money on a 0DTE product is not failing to SEE the loss, it is seeing it,
+# deciding, and being unable to ACT. Gamma goes vertical into a PM settlement: the
+# one-point index move worth a few cents of the short leg at 10:00 is worth most of
+# the width at 15:45. A hard clock is the standard control precisely because the
+# price-based stop may be unfillable exactly when it is needed.
+#
+# 1800 (30 min), the EARLY end of the 15:30-15:45 desk range, and all three reasons
+# are about what happens when the flatten itself fails:
+#  - an unpriceable flatten pages every exit_unattempted_max_s (30s), so 15:30 gives
+#    ~60 escalations before the close rather than ~30;
+#  - the walk-plus-cross escalation needs room to run twice if the first order has to
+#    be abandoned and confirmed dead (exit_cancel_settle_s);
+#  - an operator legging out by hand needs the liquid window, not the last five
+#    minutes of it.
+# The cost of being early is a little theta forgone on a position the desk has
+# already decided to be flat in.
+#
+# Refused at or above the SHORTEST session the calendar can produce
+# (market.session_open -> market.half_day_close, 12000s here): a larger offset puts
+# the mark before a half-day's open and every position is born triggered.
+#
+# NOTE this trigger bypasses sustained_s deliberately — a clock reading is monotonic
+# and has no quote artifact to debounce — and past this mark a position whose exit
+# attempts are already spent gets ONE further closing order, through the duplicate
+# guard. Neither is incidental; both are argued in the decision record.
+# → docs/decisions/2026-08-28-time-based-flatten-trigger.md
+flatten_before_close_s = 1800.0
+
+# How long an order Argus has STOPPED MANAGING may remain confirmed-working at the
+# broker before it pages again — and the floor on how often its cancel is
+# re-requested (2026-08-29, P5). REQUIRED; refused at or below refresh_interval_s
+# (15.0), because the recheck rides the refresh cadence and a bound under it would
+# page and re-cancel on every poll.
+#
+# What it is for. `_request_cancel` is best-effort and swallows every exception, so
+# a cancel that RAISED and a cancel that was ACCEPTED and stuck at `Cancel
+# Requested` look identical from outside: a live order nobody is walking. On
+# 2026-08-28 order 1424563's DELETE came back a 502 at 10:10 and the order was
+# still working at 12:15, when a restart's reconciliation halted on it. The kill
+# switch's stated guarantee reaches "an entry order already working at the
+# exchange" through exactly that best-effort path.
+#
+# 900 (15 min), and the number is chosen against the PHONE, not the log. Past the
+# geometric backoff (15s, 30s, 60s, 120s, 240s, 480s — in code, not here) this is
+# both the re-cancel interval and the page interval, so a four-hour stuck order
+# costs ~30 cancel requests and ~20 Tier 1 escalations across a full session. It
+# deliberately matches SlackNotifier's own 900s throttle: a tighter bound would
+# only produce records that arrive at the phone as a `(+N suppressed)` count.
+#
+# Why not reuse exit_unattempted_max_s (30.0): that key means "a triggered position
+# has not been closed", which is a genuinely more urgent condition than an unfilled
+# OTM opening order. At 30s this would write ~600 Tier 1 records over one afternoon
+# for one unchanging fact — the volume _Escalation exists to prevent.
+#
+# A RATE bound, never a COUNT — the opposite of the exit path's send budget, and
+# deliberately: a cancel is not a submission, and three attempts would have been
+# spent inside the 10:00-10:13 outage and never retried after cert recovered.
+# → docs/decisions/2026-08-29-mid-session-cancel-recheck.md
+unmanaged_order_max_s = 900.0
+
+# Whether that recheck actually SENDS the re-cancel, or only decides and records it.
+#
+# OPTIONAL and defaulting to false, the same way execution.dry_run_submissions
+# defaults to true: to the side that sends nothing, so an image carrying P5 cannot
+# start cancelling orders against a config written before it.
+#
+# false is `would_cancel` — the same registry and the same decision (direction from
+# what Argus MINTED, the OPEN/CLOSE split, the identifier cross-check, the
+# working/terminal/absent reading), computed and recorded at Tier 2 with no broker
+# call. That is shadow.would_submit's shape, and it is the staged rollout: every
+# residual it registers exercises the inputs on real cert data with nothing at the
+# broker's end. Promote by flipping this to true — no code change, no redeploy of
+# anything but this file.
+#
+# NB an OPENING order is all that is ever cancelled here. A closing one is paged and
+# never touched, under any halt or grade: cancelling a close strands a position.
+# → docs/decisions/2026-08-29-mid-session-cancel-recheck.md
+unmanaged_order_cancel = true
+
+# Whether the PROFIT TARGET may send (2026-09-23). REQUIRED, and a strict bool.
+# Values are IDENTICAL to live by intent (false in all three profiles), so no
+# divergence entry exists for it; see argus.live.toml for the full reasoning. The
+# trigger is evaluated and recorded either way (`profit_target` in watchdog.check's
+# true_reasons) — false only means nothing is sent. Cert cannot size it: its benefit
+# is a quote-path question (admissible here, [marketdata] source is live) but its
+# fills are cert fills.
+# → docs/decisions/2026-09-22-profit-target-and-re-entry.md (§10, §11)
+# false since v0.5.2 (2026-09-26, package B): at two slots the take frees a slot
+# that is refilled, and the replay found no robust book-level benefit in any
+# configuration while day variance rose. -> docs/research/2026-09-26-cross-document-exploration.md §3
+profit_target_enabled = false
+# The stub-close continuation (2026-09-24): a partial close's stub gets ONE
+# further close on the origin's ladder, through the guard's quantity rule.
+# Production ships true in all three profiles; false is the config-only
+# rollback of BOTH halves — no handoff, no record, and the duplicate guard back
+# to its binary rule (exactly the pre-2026-09-24 behaviour).
+# -> docs/designs/2026-09-24-quantity-aware-guard-for-close-identifiers.md
+stub_close_enabled = true
+
+# The flatten deferral (2026-09-25). FLATTEN_BEFORE_CLOSE is insurance against the
+# price triggers and the broker failing together in the last half hour; this defers
+# it only when that insurance is at least k times overpriced:
+#     k * P_touch(z) * width <= one tick
+# where z is the log distance from spot to the underlying-trigger barrier (short
+# strike +/- underlying_buffer_points) over max(implied, realized) vol * sqrt(time
+# left), and P_touch is the calibrated Pareto tail below. Only for a position nothing
+# has been sent for, whose backstop can see, whose broker is answering, and whose
+# watchdog is healthy; re-checked every tick; it only ever REMOVES the flatten. The
+# credit stop and the underlying trigger stay live to the close. A restart after
+# 15:00 (12:00 on a half-day) disables it for the rest of that day: it defers
+# only for a watchdog that has watched spot since 30 minutes before the mark.
+# "off" | "record" | "on". The loader refuses "on" unless max_concurrent_positions x
+# max_loss_per_position <= daily_max_loss (the welded invariant: what one barrier
+# event can cost across every deferred position).
+# -> docs/designs/2026-09-25-deferring-a-far-otm-flatten.md
+flatten_deferral = "on"
+# k — POLICY. Raising it is the safe direction (fewer deferrals) and needs no new
+# analysis; LOWERING it needs a tools.flatten_calibration rerun and a decision
+# record. Refused < 1. A config-only release (a restart; never between 15:00 and
+# 16:00 with a position held). 2.0 since 2026-09-28 (was 10.0):
+# -> docs/decisions/2026-09-28-flatten-deferral-k-2.md
+flatten_defer_insurance_multiple = 2.0
+# z99 and alpha — CALIBRATION OUTPUTS of `python -m argus.tools.flatten_calibration`,
+# never hand-tuned. alpha is refused outside (1, 3].
+flatten_defer_tail_z99 = 2.60
+flatten_defer_tail_alpha = 2.72
+flatten_defer_source = "k = 2.0 decided by Richard 2026-09-28 (docs/decisions/2026-09-28-flatten-deferral-k-2.md; was 10.0, decided 2026-09-25): decline the flatten only when its one-tick premium is at least 2x the expected loss it covers, valuing a touch at the full width, i.e. P_touch <= 5e-3 on a 5-wide, z >= 3.35 at this calibration. z99 = 2.60 and alpha = 2.72 are the OUTPUT of `python -m argus.tools.flatten_calibration --config argus.dev.toml --db dev/nas/argus-20260914T163001.db --db dev/nas/argus-20260928T163001.db` run 2026-09-29 (both read mode=ro): 30 non-event sessions 2026-08-05..2026-09-28 (6 excluded: 1 FOMC and 5 CPI/NFP/PCE release days, docs/decisions/2026-09-29-the-flatten-calibration-excludes-release-days.md),z99 the envelope of the 5/10/15/20/30-minute p99 (2.42/2.41/2.44/2.51/2.60); Hill alpha 3.33 with a 90% day-bootstrap interval [2.72, 4.74], so alpha = min(3, lower bound) = 2.72. Heavier than the 2026-09-28 calibration (2.38 / 2.80), all from one session (2026-09-28, several 4-sigma 30-minute windows, largest 4.4): the 30-minute p99 2.38 -> 2.60, and the Hill estimate 3.76 -> 3.33, inside the previous interval [2.80, 5.48]. No formal trigger fired; a rerun ships in either direction (docs/decisions/2026-09-28-flatten-deferral-k-2.md, the v0.5.5 amendment). At the k = 2 boundary the model touch probability (0.50%) is at or above the data (0.45% of 17,000 all-day 30-minute windows; 3 against 2.9 expected in 580 non-overlapping); the largest standardized 15:30-16:00 move in 27 sessions is 1.93. Pricing and backtest: docs/research/2026-09-28-audit-due-diligence-queries/flatten_k.py. Rerun the tool before any change to z99 or alpha, and at every recalibration trigger in the design section 4.7."
+
+# Provenance, required and refused if blank — same rule as coa.source and
+# execution.walk_source. This is what makes who-chose-these-and-why a fact in the
+# deployed config rather than a comment somebody edits around. It must move with
+# the values above.
+trigger_source = "SANDBOX-ENTRY values, chosen by Richard 2026-08-10. NOT final live-scale values — a second, data-backed pass is planned before scaling size. credit_multiple=2.0 is the best-supported of the seven: 2x credit is tastytrade-lineage convention whose backtests are mostly 30-60 DTE, but direct 0DTE practitioner precedent puts the real range at 2.0-2.5x (a 0DTE MEIC trader's automated stop at 2x initial credit; another SPX 0DTE credit-spread example at 2.5x), so 2.0 is the tighter/safer end rather than an import from a longer-dated strategy. underlying_buffer_points=5.0 is a LIQUIDITY BACKSTOP, not the primary loss driver: at ~0.15 delta the short strike sits tens of points OTM for most of the entry window, so credit_multiple should almost always bind first — validate it by watchdog.exit_unpriceable / watchdog.unwatchable frequency during wide-quote episodes, NOT by trigger rate on an ordinary day. sustained_s=5.0 (5x cadence_s) is a deliberately conservative debounce; Cboe's 2023 Enhanced Drill Through Protection has reduced rogue-print risk industry-wide, so it could plausibly be shortened later, but the asymmetry favours keeping it — the cost of 5.0s is a few seconds of exit delay, the cost of shortening is false-positive exits on one wide quote, which is real capital. THE EXIT WALK'S TWO KEYS were added to this note on 2026-09-17, because that pass's evidence came out of THIS environment and the provenance must move with the values. exit_walk_away_pct=0.20 is the entry's 0.10 doubled and was never independently derived; the 2026-09-17 pass HELD it, on 37 exit walks in the 2026-09-14 backup of this database. It governs only the credit-stop regime (all 23 credit-stop exits opened at 0.95 or above, so 4-8 rungs), every credit-stop fill landed at step 0, 1 or once 4, and an UNREACHED rung is free — so narrowing buys nothing, and lowering to 0.10 would halve the range on CERT FILL evidence whose bias runs the wrong way: if this environment fills too easily it overstates how little concession is needed, which is exactly why a number measured here cannot size this change on its own. The QUOTE half is different and is admissible, because [marketdata] source is live here too. THE WIDTH CAP IS MISSING AND FIRED HERE ON 2026-09-03: argus-close-20260903-call-7725-7730 (width 5.00) opened at -5.05 with a floor of -6.05 and filled at -5.05 for -870.00 against -860.00 for holding to settlement, and the breach was at the OPENING LIMIT rather than the floor. Capping both is a CODE change owed ahead of further tuning. exit_walk_min_steps=3 since 2026-09-17, up from the 1 added 2026-08-31: the exit opening-limit distribution is bimodal with an empty band (12 flatten exits at 0.05/0.10, 23 credit-stop at 0.95-1.95, nothing between), so 3 binds only below |0.75| and touches only the flatten rows — overturning 2026-08-31's claim that 1 is the unique value which changes no row that already works: true at n=2, false at n=37. Values are IDENTICAL to live by intent; only this prose diverges. See docs/decisions/2026-09-17-exit-ladder-second-pass.md and docs/execution-watchdog-parameters-2026-08-10.md."
+
+[chain]
+# TWO DIFFERENT SYMBOLS. 0DTE weeklies are under the SPXW root — fetching the
+# chain from "SPX" returns only monthly third-Friday expirations and yields an
+# empty 0DTE chain. Spot must come from the SPX index (an option root can't be
+# quoted as an index).
+underlying_symbol = "SPX"     # index, for the spot quote
+chain_symbol = "SPXW"         # option root, carries 0DTE
+# The 0DTE chain is hundreds of strikes; the strategy only works near the money.
+strike_window_points = 150.0
+
+[market]
+# WHEN the always-on supervisor runs a session — scheduling correctness, not
+# strategy. `python -m argus` is always-on; the market is not. A session runs
+# only on a trading day, from session_open to the close. session_open is a few
+# minutes after the 09:30 ET open so the 0DTE chain has warmed up before the
+# 10:00 entry window (see [signal]). session_close/half_day_close are the regular
+# and early (1:00 PM) NYSE closes.
+#
+# NOT the same as macro-event blackout days (FOMC/CPI/NFP) — those are a deferred
+# strategy/risk decision, not a calendar fact.
+session_open = "09:40"       # ET
+session_close = "16:00"      # ET
+half_day_close = "13:00"     # ET — half-days end here (fail toward the EARLY close)
+
+# NYSE full-closure holidays and half-day (1:00 PM close) dates, ISO YYYY-MM-DD.
+# THIS IS AN OPERATOR-MAINTAINED CALENDAR — the market calendar is not derivable
+# from code. Keep it current against the official NYSE holiday calendar; a date
+# in both lists is treated as a full closure (holidays win). 2027 entries
+# RE-VERIFIED 2026-09-11 against the official NYSE calendar (observed-date rules
+# shift with the weekday the holiday falls on) — 2028 entries, once added, will
+# need the same pass.
+holidays = [
+  # 2026
+  "2026-01-01",  # New Year's Day
+  "2026-01-19",  # Martin Luther King Jr. Day
+  "2026-02-16",  # Washington's Birthday
+  "2026-04-03",  # Good Friday
+  "2026-05-25",  # Memorial Day
+  "2026-06-19",  # Juneteenth
+  "2026-07-03",  # Independence Day (observed; Jul 4 is a Saturday)
+  "2026-09-07",  # Labor Day
+  "2026-11-26",  # Thanksgiving Day
+  "2026-12-25",  # Christmas Day
+  # 2027 (re-verified 2026-09-11)
+  "2027-01-01",  # New Year's Day
+  "2027-01-18",  # Martin Luther King Jr. Day
+  "2027-02-15",  # Washington's Birthday
+  "2027-03-26",  # Good Friday
+  "2027-05-31",  # Memorial Day
+  "2027-06-18",  # Juneteenth (observed; Jun 19 is a Saturday)
+  "2027-07-05",  # Independence Day (observed; Jul 4 is a Sunday)
+  "2027-09-06",  # Labor Day
+  "2027-11-25",  # Thanksgiving Day
+  "2027-12-24",  # Christmas Day (observed; Dec 25 is a Saturday)
+]
+half_days = [
+  # 2026
+  "2026-11-27",  # day after Thanksgiving
+  "2026-12-24",  # Christmas Eve
+  # 2027 (re-verified 2026-09-11)
+  "2027-11-26",  # day after Thanksgiving
+]
+
+# Session-open login resilience. The always-on process no longer exits on a
+# failed login (systemd used to absorb cert warmup failures), so the retry moves
+# in-app. BAN RISK is the constraint: failed OAuth refreshes accrue toward
+# tastytrade's undocumented IP-block threshold, so this mirrors the retired unit
+# — a handful of attempts, a flat ~10-min gap (NOT exponential; backing off
+# faster early would mean more attempts in the ban window). 6 x 10 min ≈ 50 min
+# from 09:40 covers the observed cert-recovery window; if cert is down longer the
+# day is MISSED (acceptable in shadow), never an 8-hour block that costs tomorrow.
+login_attempts = 6
+login_retry_interval_s = 600.0
+
+[events]
+# SAME-DAY MACRO-EVENT ENTRY BLACKOUT. On any date in the file below, the
+# strategy proposes nothing at all — no candidate, no gate call, no entry.
+#
+# This is the one research-motivated extension that ships ENABLED, and the reason
+# is that it has no threshold to fit: it is a categorical date list, and standing
+# down around FOMC/CPI/NFP/PCE is practitioner convention for 0DTE rather than a
+# hypothesis under test. Argus's own shadow record agrees — 2026-07-29 (an FOMC
+# decision day) was the largest-magnitude loss day in the would-submit tally to
+# date, and the one day whose damage was cleanly attributable to a macro block.
+#
+# Contrast `[regime]`, which is ABSENT on purpose: the skew/IV gate needs months
+# of the per-tick telemetry the loop now records before any threshold there would
+# mean anything. Adding a [regime] section is a live behaviour change; do not add
+# one to "complete" this file.
+#
+# The path is read at SESSION START, not per tick. A missing file is a hard
+# ConfigError rather than an empty blackout: `enabled = true` against no file
+# means the operator believes entries are suppressed while nothing is, and that
+# belief is worth more than a session.
+#
+# SINCE 2026-09-28 THE 08:30 RELEASES ARE OMITTED BY POLICY: entries ARE taken
+# on CPI, NFP and PCE days. They print 90 minutes before entry_earliest, so the 0DTE
+# chain has repriced by 10:00; the blackout's one piece of evidence is an FOMC day
+# (a 14:00 intraday event); and the five recorded release days realized LESS
+# against 10:00 implied than the other 27 (RMS z 0.45 vs 0.62). FOMC and the
+# discretionary dates stay blacked out. A pre-registered forward test with an
+# abort threshold decides whether the omission stays:
+# -> docs/decisions/2026-09-28-trading-the-8-30-release-days.md
+#
+# Regenerate with `python -m argus.tools.blackout_dates --omit CPI --omit NFP
+# --omit PCE` (FRED for CPI/NFP/PCE, still fetched and checked when omitted;
+# hand-maintained fomc_dates.txt for FOMC). The file is bind-mounted next to this
+# config, so — like this config — it is versioned by git on the droplet and does
+# NOT roll back with the image tag.
+enabled = true
+blackout_dates_path = "/etc/argus/blackout_dates.txt"
+
+[server]
+# The authenticated HTTP control surface — spec §6's "kill switch reachable in
+# one action, from a phone, at any time". The supervisor runs a small always-on
+# server exposing exactly ONE route, `POST /kill`, which trips the kill switch and
+# halts new entries. Because that route halts trading, it must be reachable ONLY
+# over the private Tailscale interface — NEVER the public internet.
+#
+# bind_host is this droplet's TAILSCALE IP (100.64.0.0/10). Set it to the address
+# `tailscale ip -4` reports on the box. It must be a concrete interface address:
+# a wildcard (0.0.0.0 / :: / empty) is REFUSED by config.py because it would
+# expose the halt control to the internet, and if the configured address is not
+# actually present on the host the process refuses to start rather than falling
+# back to a wider bind.
+#
+# The bearer token that authenticates callers is NOT here — it is a secret and
+# comes from the environment (ARGUS_KILL_TOKEN), never config or code. See the
+# CLAUDE.md "Kill switch — phone-side trigger" note for the exact one-liner.
+#
+# REPLACE with this droplet's real Tailscale IP before deploy.
+bind_host = "192.0.2.10"
+bind_port = 8443
+
+[gc]
+# Garbage-collector tuning. OPTIONAL — remove this whole section and you get the
+# same defaults; it exists so the values can be changed WITHOUT AN IMAGE REBUILD,
+# because this file is bind-mounted and the image is not.
+#
+# WHY THIS EXISTS. Measured 2026-08-05: event-loop lag climbed ~+0.21s/hour from
+# ~0.07s at the open to a 1.3s mean (2.2s peak) by 15:00, identically on every
+# session from 07-28 to 08-04, resetting on process restart. Root-caused to gen-2
+# GC — its FREQUENCY is set by the market-data allocation rate (~2,420 events/sec
+# across 121 symbols x Quote+Greeks => a gen-2 pass every ~7s at CPython's stock
+# threshold, matching the observed ~9-10s stall period) and its COST is LINEAR in
+# live-object count (4ms at 50k objects, 198ms at 2M, roughly 4x that on this
+# droplet's vCPU).
+#
+# NOTE this is a MITIGATION, not a cure. Whatever accumulates live objects is
+# still unidentified; these two levers cut how often GC runs and how much it has
+# to scan. See CLAUDE.md, "The intra-session lag ramp".
+
+# gc.freeze() once startup is complete: moves the interpreter, every imported
+# module, the config and all code objects into a generation gen-2 never rescans.
+# They are long-lived by definition and were being re-traversed every few seconds
+# forever. Measured: a 197ms gen-2 pause over a 2M-object heap -> 0.0ms.
+freeze_on_startup = true
+
+# gen-2 threshold multiplier. CPython's default is 10, i.e. a gen-2 pass every
+# ~70,000 net container allocations — about every 7 seconds at this process's
+# allocation rate. 100 makes it roughly once a minute: an order of magnitude fewer
+# pauses, at the cost of garbage living a little longer between them, which is the
+# right trade on a 4GB box holding ~114MB.
+#
+# gen-0 and gen-1 are deliberately NOT configurable. They are cheap, they collect
+# the short-lived quote churn that genuinely needs collecting, and slowing them
+# would grow the heap for no benefit.
+gen2_threshold = 100
+
+# TO RESTORE STOCK CPYTHON BEHAVIOUR (restart only, no rebuild):
+#   freeze_on_startup = false
+#   gen2_threshold = 10

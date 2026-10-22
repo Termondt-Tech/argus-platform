@@ -1,0 +1,309 @@
+# DEVELOPMENT config. Identical to argus.toml EXCEPT audit.db_path.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `argus.toml` has `db_path = "argus.db"`, resolved against the working
+# directory. Any command run from the repo root — `python -m argus`, a smoke
+# tool, a quick experiment — therefore writes to the LIVE audit database. On
+# 2026-07-21 exactly that happened during a running shadow session: the stray
+# process stole three `seq` values, wedged the session's audit writer, and cost
+# ~80 minutes of unrecorded signal data.
+#
+# The single-writer lock (db/lock.py) now makes that specific collision
+# impossible — a second writer is refused rather than admitted. This file closes
+# the other half: dev work should not be *contending* for the live DB in the
+# first place, and should never be able to write to it.
+#
+# USE IT FOR EVERYTHING THAT IS NOT A REAL DATA-COLLECTION RUN:
+#
+#   ARGUS_CONFIG=argus.dev.toml ./.venv/bin/python -m argus
+#   ./.venv/bin/python -m argus.tools.quotes  --config argus.dev.toml SPX
+#   ./.venv/bin/python -m argus.tools.account --config argus.dev.toml
+#   ./.venv/bin/python -m argus.tools.shadow  --config argus.dev.toml --minutes 5
+#
+# Real shadow sessions — the ones whose data you intend to analyse — use
+# `argus.toml`. That is the ONLY thing that should ever open argus.db.
+
+environment = "shadow"
+
+[broker]
+# Timeout (seconds) for every broker REST call. NOT a library default — the
+# tastytrade SDK passes no timeout to httpx, so this was silently 5s until
+# 2026-07-23, when the droplet's first shadow run died on a cold
+# GET /customers/me/accounts at exactly that bound. The cert API is documented
+# below (staleness.account_refresh_timeout_s) as hanging and 502-ing; a first
+# authenticated call from a new host is when that bites.
+#
+# This is the client-wide DEFAULT. Callers needing a tighter bound still set
+# their own — the account liveness refresher wraps its round trip in
+# asyncio.timeout(account_refresh_timeout_s), which cancels first.
+http_timeout_s = 30.0
+# WHICH tastytrade account this process trades. EMPTY here = unpinned: take the
+# login's first account, which is what every environment did before 2026-09-10 and
+# is harmless on a cert login holding one account. Deliberately not pinned: cert
+# accounts are re-provisioned by tastytrade, and a pinned number that stops
+# existing is a PERMANENT SessionAborted that parks the process.
+#
+# `environment = "live"` REFUSES an empty value (config.py) — that is the whole
+# point of the key, and the reason it exists in this file at all is that
+# tests/test_config_profiles.py requires identical key sets across the profiles.
+# -> docs/decisions/2026-08-31-live-account-is-not-dedicated.md
+account_number = ""
+
+[reconcile]
+# See argus.toml for the full reasoning. Dev keeps the same per-request bound but
+# a MUCH shorter outer budget: a tool run that hangs for 30 minutes waiting on
+# cert is a wasted afternoon, and dev has no session to protect.
+request_timeout_s = 10.0
+retry_interval_s = 10.0
+retry_budget_s = 60.0
+
+[marketdata]
+# Dev defaults to SANDBOX quotes: no live-registration credentials needed, and
+# no reason to burn a production market-data session on a mechanics test.
+source = "sandbox"
+
+[coa]
+response_window_ms = 100
+extended_processing_ms = 900
+source = "SR-CBOE-2025-074, SEC accelerated approval 2026-03-25 — permanently removed the sunset provision, authorizing the 900ms extended-processing allowance for non-FLEX classes with no expiration. Re-verified against Cboe's published SPX/SPXW COA/AIM auction timing configuration 2026-09-11: response_window_ms = 100 (auction response interval) and extended_processing_ms = 900 (NIC/matching-engine processing allowance, capped at 1000ms total) are correct as configured."
+
+[risk]
+daily_max_loss = 1740.0
+# SPREADS, not legs (fixed 2026-08-13). 1 mirrors argus.toml — see there for why
+# raising it is a risk decision rather than a bug fix.
+max_concurrent_positions = 2
+position_size_pct = 0.02
+max_loss_per_position = 475.0
+max_contracts_per_position = 1
+
+# THE SIDE-BALANCE RULE (v0.5.2, 2026-09-26). A new spread may open only on a side
+# that leaves |puts - calls| <= max_side_imbalance, and among the sides that qualify
+# on a tick the one leaving the book more balanced goes first (ties in signal.sides
+# order: put first). At two slots and 1 that is AT MOST ONE OPEN SPREAD PER SIDE.
+# Chosen in the orchestrator, re-checked by the gate (side_imbalance_exceeded).
+# Counted per side exactly as the concurrency cap counts in total (per trade idea,
+# broker legs by right, working opening orders). side_balance = false is the
+# pre-v0.5.2 entry path exactly, and the config-only rollback.
+# -> docs/designs/2026-09-26-multi-spread-side-balance.md,
+#    docs/decisions/2026-09-26-one-position-per-side.md
+side_balance = true
+max_side_imbalance = 1
+
+[staleness]
+market_data_max_age_s = 2.0
+# Matches argus.toml, which carries the full reasoning. Kept in step deliberately:
+# a dev config that admits short strikes on a different bound than production makes
+# every tool run non-comparable with the session it is meant to explain.
+greeks_max_age_s = 120.0
+account_stream_max_age_s = 120.0
+account_refresh_s = 10.0
+account_refresh_timeout_s = 5.0
+account_position_evict_after_s = 60.0
+
+[audit]
+# THE POINT OF THIS FILE. Gitignored (see .gitignore) so dev runs never produce
+# a diff and never collide with the real chain.
+db_path = "dev/argus-dev.db"
+# Dev scratch data — nothing here is worth an fsync per commit.
+synchronous = "NORMAL"
+tier2_queue_maxsize = 10000
+tier2_queue_alert_depth = 7500
+
+[heartbeat]
+interval_s = 0.1
+lag_alert_threshold_s = 0.05
+sustained_breach_count = 5
+# Do NOT set true — the 120-contract chain subscribe stalls the loop ~0.5s at
+# every session start, which reaches sustained_breach_count and would engage the
+# process-lifetime kill switch daily. See argus.toml for the measurement.
+trip_on_sustained_stall = false
+
+[signal]
+sides = ["put", "call"]
+target_short_delta = 0.15
+width = 5.0
+max_width = 25.0
+min_credit = 0.50
+entry_earliest = "10:00"
+entry_latest = "15:00"
+cadence_s = 5.0
+# WHICH delta chooses the short strike (2026-09-21). "mid": the delta implied by
+# each out-of-the-money leg's OWN MID — the same quotes the credit is computed
+# from, so `min_credit` stops selecting strikes the feed under-states (the five
+# live call entries of 2026-09-21 were ~0.19 delta, not 0.15). "feed": the greeks
+# feed's delta, the pre-2026-09-21 behaviour. REQUIRED, no default. Switching
+# back to "feed" IS THE ROLLBACK — a config-only release, after the close, never
+# mid-session with a position open. Changing it changes which strike is traded;
+# never pool call outcomes across the change (split on `delta_source`).
+# → docs/decisions/2026-09-21-short-strike-selection-on-mid-implied-delta.md
+short_delta_source = "mid"
+
+[execution]
+signal_max_age_s = 1.0
+
+# Price-walking loop. MIRRORS argus.toml's sandbox-entry values (chosen by Richard
+# 2026-08-10, not final live-scale) — keep them in step so a dev run reproduces
+# production's walk; walk_source says why. Dev runs are shadow/tool runs that
+# submit nothing, so nothing here reaches a market.
+entry_cadence_s = 4.0
+entry_step_ticks = 1
+entry_walk_away_pct = 0.10
+# Points of underlying drift from the gate-time price that abandon a walk.
+entry_drift_abort_points = 3.0
+walk_source = "Mirrors argus.toml's sandbox-entry values, chosen by Richard 2026-08-10. Dev config: shadow/tool runs submit nothing, so these are inert here. Rationale and the measured walk-away budget live in argus.toml's walk_source and docs/execution-watchdog-parameters-2026-08-10.md — keep the VALUES in step with argus.toml so a dev run reproduces production's walk."
+working_timeout_s = 30.0
+status_poll_interval_s = 1.0
+max_recovery_attempts = 3
+max_order_requests_per_second = 40.0
+# Duplicate-guard bound and the blind-idea streak that ends the day. Mirrors
+# argus.toml; inert here, because the retry burst only exists on the LIVE-FIRE
+# branch and this config is dry-run always — a guard failure here abandons the
+# candidate on the first exception, as it has since 2026-08-11.
+# → docs/decisions/2026-08-26-entry-guard-unreachable-retry.md
+guard_timeout_s = 3.0
+guard_unreachable_max_streak = 3
+# Dev config: dry-run, always. See argus.toml for what this flag does and does not
+# prove. Nothing run from this file should ever route a real order.
+dry_run_submissions = true
+
+[watchdog]
+# Position risk watchdog. MIRRORS argus.toml's sandbox-entry trigger levels
+# (chosen by Richard 2026-08-10, not final live-scale); trigger_source says why.
+# Dev runs are shadow/tool runs that hold no positions, so the watchdog has
+# nothing to watch and nothing here reaches a market.
+cadence_s = 1.0
+refresh_interval_s = 15.0
+# Settle allowance for the booked_but_absent book disagreement only — see
+# argus.toml for the 2026-08-13 measurement behind the value. Inert here (a dev
+# run books nothing), kept in step so a dev run reproduces production's behaviour.
+book_settle_s = 20.0
+# Shelf life of one REST book-confirm verdict per (broker_legs, ledger_legs) shape.
+# See argus.toml for the sizing. Inert here for the same reason as book_settle_s.
+book_confirm_ttl_s = 90.0
+credit_multiple = 3.0
+# THE STRIKE-TOUCH STOP (v0.5.2, 2026-09-26): the credit trigger above does NOT
+# fire. The emergency exit is the underlying trigger alone, at buffer 0 (below):
+# spot reaching the SHORT STRIKE, held sustained_s. credit_multiple stays set and
+# credit_stop is still computed and recorded (the profit target and the blind page
+# share its input), so true here is the config-only rollback to the credit stop.
+# The replay: +$49-71/day against the 2x stop over 24 sessions, both folds, both
+# marks, robust to slippage; better in 3 of 4 path models, tail no worse in any.
+# -> docs/decisions/2026-09-26-strike-touch-stop.md
+credit_trigger_enabled = false
+# 0.0 since v0.5.2 (2026-09-26): the strike-touch stop, see credit_trigger_enabled.
+underlying_buffer_points = 0.0
+sustained_s = 5.0
+exit_cadence_s = 1.0
+exit_step_ticks = 1
+exit_walk_away_pct = 0.20
+# Floor under that percentage, in reprices: below a debit of 0.125 the percentage
+# rounds away and the ladder has NO rungs. Raised 1 -> 3 on 2026-09-17 with the other
+# two profiles; it binds only below |0.75|, which the measured opening-limit distribution
+# shows is the flatten regime alone. Kept in step with argus.sandbox.toml; see there for
+# the reasoning. → docs/decisions/2026-09-17-exit-ladder-second-pass.md
+# → docs/decisions/2026-08-31-exit-ladder-near-tick.md
+exit_walk_min_steps = 3
+exit_cancel_settle_s = 3.0
+exit_unattempted_max_s = 30.0
+# 15:30 ET normally, 12:30 on a half-day. Kept in step with argus.toml; see there
+# for the reasoning. → docs/decisions/2026-08-28-time-based-flatten-trigger.md
+flatten_before_close_s = 1800.0
+# The residual-order recheck's page/re-cancel bound, and its rollout switch. Kept in
+# step with argus.toml; see there for the reasoning. Inert in a dev run — shadow
+# submits nothing, so no walk ever leaves a residual to watch.
+# → docs/decisions/2026-08-29-mid-session-cancel-recheck.md
+unmanaged_order_max_s = 900.0
+unmanaged_order_cancel = false
+# The profit target's send switch. Kept in step with argus.live.toml; see there for
+# the reasoning. Inert in a dev run — shadow holds no positions.
+# → docs/decisions/2026-09-22-profit-target-and-re-entry.md
+# false since v0.5.2 (2026-09-26, package B): at two slots the take frees a slot
+# that is refilled, and the replay found no robust book-level benefit in any
+# configuration while day variance rose. -> docs/research/2026-09-26-cross-document-exploration.md §3
+profit_target_enabled = false
+# The stub-close continuation (2026-09-24): a partial close's stub gets ONE
+# further close on the origin's ladder, through the guard's quantity rule.
+# Production ships true in all three profiles; false is the config-only
+# rollback of BOTH halves — no handoff, no record, and the duplicate guard back
+# to its binary rule (exactly the pre-2026-09-24 behaviour).
+# -> docs/designs/2026-09-24-quantity-aware-guard-for-close-identifiers.md
+stub_close_enabled = true
+
+# The flatten deferral (2026-09-25). FLATTEN_BEFORE_CLOSE is insurance against the
+# price triggers and the broker failing together in the last half hour; this defers
+# it only when that insurance is at least k times overpriced:
+#     k * P_touch(z) * width <= one tick
+# where z is the log distance from spot to the underlying-trigger barrier (short
+# strike +/- underlying_buffer_points) over max(implied, realized) vol * sqrt(time
+# left), and P_touch is the calibrated Pareto tail below. Only for a position nothing
+# has been sent for, whose backstop can see, whose broker is answering, and whose
+# watchdog is healthy; re-checked every tick; it only ever REMOVES the flatten. The
+# credit stop and the underlying trigger stay live to the close. A restart after
+# 15:00 (12:00 on a half-day) disables it for the rest of that day: it defers
+# only for a watchdog that has watched spot since 30 minutes before the mark.
+# "off" | "record" | "on". The loader refuses "on" unless max_concurrent_positions x
+# max_loss_per_position <= daily_max_loss (the welded invariant: what one barrier
+# event can cost across every deferred position).
+# -> docs/designs/2026-09-25-deferring-a-far-otm-flatten.md
+flatten_deferral = "on"
+# k — POLICY. Raising it is the safe direction (fewer deferrals) and needs no new
+# analysis; LOWERING it needs a tools.flatten_calibration rerun and a decision
+# record. Refused < 1. A config-only release (a restart; never between 15:00 and
+# 16:00 with a position held). 2.0 since 2026-09-28 (was 10.0):
+# -> docs/decisions/2026-09-28-flatten-deferral-k-2.md
+flatten_defer_insurance_multiple = 2.0
+# z99 and alpha — CALIBRATION OUTPUTS of `python -m argus.tools.flatten_calibration`,
+# never hand-tuned. alpha is refused outside (1, 3].
+flatten_defer_tail_z99 = 2.60
+flatten_defer_tail_alpha = 2.72
+flatten_defer_source = "k = 2.0 decided by Richard 2026-09-28 (docs/decisions/2026-09-28-flatten-deferral-k-2.md; was 10.0, decided 2026-09-25): decline the flatten only when its one-tick premium is at least 2x the expected loss it covers, valuing a touch at the full width, i.e. P_touch <= 5e-3 on a 5-wide, z >= 3.35 at this calibration. z99 = 2.60 and alpha = 2.72 are the OUTPUT of `python -m argus.tools.flatten_calibration --config argus.dev.toml --db dev/nas/argus-20260914T163001.db --db dev/nas/argus-20260928T163001.db` run 2026-09-29 (both read mode=ro): 30 non-event sessions 2026-08-05..2026-09-28 (6 excluded: 1 FOMC and 5 CPI/NFP/PCE release days, docs/decisions/2026-09-29-the-flatten-calibration-excludes-release-days.md),z99 the envelope of the 5/10/15/20/30-minute p99 (2.42/2.41/2.44/2.51/2.60); Hill alpha 3.33 with a 90% day-bootstrap interval [2.72, 4.74], so alpha = min(3, lower bound) = 2.72. Heavier than the 2026-09-28 calibration (2.38 / 2.80), all from one session (2026-09-28, several 4-sigma 30-minute windows, largest 4.4): the 30-minute p99 2.38 -> 2.60, and the Hill estimate 3.76 -> 3.33, inside the previous interval [2.80, 5.48]. No formal trigger fired; a rerun ships in either direction (docs/decisions/2026-09-28-flatten-deferral-k-2.md, the v0.5.5 amendment). At the k = 2 boundary the model touch probability (0.50%) is at or above the data (0.45% of 17,000 all-day 30-minute windows; 3 against 2.9 expected in 580 non-overlapping); the largest standardized 15:30-16:00 move in 27 sessions is 1.93. Pricing and backtest: docs/research/2026-09-28-audit-due-diligence-queries/flatten_k.py. Rerun the tool before any change to z99 or alpha, and at every recalibration trigger in the design section 4.7."
+trigger_source = "Mirrors argus.toml's sandbox-entry values, chosen by Richard 2026-08-10. Dev config: shadow/tool runs hold no positions, so these are inert here. Rationale lives in argus.toml's trigger_source and docs/execution-watchdog-parameters-2026-08-10.md — keep the VALUES in step with argus.toml so a dev run reproduces production's triggers."
+
+[chain]
+underlying_symbol = "SPX"
+chain_symbol = "SPXW"
+strike_window_points = 150.0
+
+[market]
+# Same market calendar as argus.toml. The dev TOOL (argus.tools.shadow) runs a
+# single time-boxed session and does NOT consult this calendar, so a dev run is
+# never gated by it. It applies only to `ARGUS_CONFIG=argus.dev.toml python -m
+# argus`, the always-on path, which idles outside market hours like production.
+session_open = "09:40"
+session_close = "16:00"
+half_day_close = "13:00"
+holidays = [
+  "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+  "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+  "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+  "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+]
+half_days = ["2026-11-27", "2026-12-24", "2027-11-26"]
+# Dev retries login FAST and few — a dev at the keyboard wants a quick failure,
+# not a 50-minute ban-safe wait (that window only matters for the unattended
+# always-on process against the cert API).
+login_attempts = 2
+login_retry_interval_s = 5.0
+
+[events]
+# Same macro-event blackout as production, pointed at the repo-relative file —
+# dev tools run from the repo root, where the container runs from /data.
+# Enabled here on purpose: a dev run that skips the blackout would not be
+# exercising the same signal path the deployed process runs.
+enabled = true
+blackout_dates_path = "blackout_dates.txt"
+
+[server]
+# Dev binds the kill-switch control surface to LOOPBACK — no Tailscale needed on a
+# laptop, and it stays off every other interface. Still requires ARGUS_KILL_TOKEN
+# in .env like production (the endpoint is never unauthenticated). Test it with:
+#   curl -s -XPOST -H "Authorization: Bearer $ARGUS_KILL_TOKEN" http://127.0.0.1:8443/kill
+bind_host = "127.0.0.1"
+bind_port = 8443
+
+[gc]
+# See argus.toml for the measurement behind these. Defaults if the section is
+# absent; set freeze_on_startup=false / gen2_threshold=10 for stock CPython.
+freeze_on_startup = true
+gen2_threshold = 100

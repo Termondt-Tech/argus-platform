@@ -1,0 +1,190 @@
+# Argus — single service. Not a cluster, not an orchestration layer.
+#
+# Supervision is deliberately two-layer:
+#   - `restart: unless-stopped` here    -> Docker restarts the CONTAINER if the
+#                                          process dies, and brings it back when
+#                                          the daemon itself restarts.
+#   - `Restart=always` in argus.service -> systemd restarts the COMPOSE stack if
+#                                          compose itself dies, and starts it on
+#                                          droplet boot.
+# Neither layer alone covers both failures.
+
+services:
+  argus:
+    # Tag-addressable so a rollback is `ARGUS_IMAGE_TAG=<previous> docker compose up -d`
+    # with no rebuild and no dependency archaeology. Compose reads ./.env for
+    # interpolation, so setting ARGUS_IMAGE_TAG there pins the deployed version.
+    image: argus:${ARGUS_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # NO `args:` here, deliberately. The image takes an `ARGUS_VERSION` build arg
+      # (Dockerfile) that stamps `argus/_version.py` so `/status` can say which build
+      # is running — and it is passed on the COMMAND LINE, computed fresh every time:
+      #
+      #   docker compose build --build-arg ARGUS_VERSION=$(git describe --tags --always --dirty)
+      #
+      # Declaring `ARGUS_VERSION: ${ARGUS_VERSION:-unknown}` here would also work, and
+      # is the same trap `ARGUS_IMAGE_TAG` is already warned about in the runbook: it
+      # reads `.env`, `.env` is edited by hand and not by the deploy, and the first
+      # deploy where the code moves and that line does not produces an image
+      # confidently labelled with the PREVIOUS release. A wrong version label is worse
+      # than no version label — `unknown` is honest, a stale tag is not.
+    container_name: argus
+
+    # PID 1 reaper + correct signal forwarding. The supervisor installs its own
+    # SIGTERM handler and unwinds cleanly, but PID 1 semantics are a sharp edge
+    # not worth leaving exposed on a process that must shut down cleanly to
+    # flush the audit chain.
+    init: true
+
+    restart: unless-stopped
+
+    # Host networking, REQUIRED by the kill-switch control surface (spec §6).
+    # `POST /kill` (control.py) binds the droplet's TAILSCALE interface
+    # (`[server] bind_host` in the profile config) so the halt control is reachable over
+    # the tailnet and NOWHERE else. That interface (tailscale0, 100.64.0.0/10)
+    # lives in the HOST network namespace; a bridged container cannot bind it, so
+    # the app — which fails loud rather than falling back to a wider bind — would
+    # refuse to start. Host mode puts the container in the host netns so the
+    # Tailscale IP is bindable and the endpoint is reachable from a phone.
+    #
+    # The alternative (publish a port + bind 0.0.0.0 inside the container) is
+    # rejected on purpose: config.py forbids a wildcard bind, because 0.0.0.0
+    # would also answer on the public interface. Host networking keeps the bind
+    # pinned to exactly the Tailscale IP. Argus opens no listening socket other
+    # than this one, so sharing the host netns exposes nothing else.
+    network_mode: host
+
+    # Shutdown drains the Tier 2 telemetry queue and closes SQLite. The 10s
+    # default risks SIGKILL mid-drain, which loses audit records — the one class
+    # of data this system cannot regenerate.
+    stop_grace_period: 30s
+
+    # Credentials arrive ONLY here, at runtime. Never in the image, never in
+    # the config, never on the command line (where `ps` would show them).
+    # Copy .env.example -> .env and fill it in; .env is gitignored.
+    env_file:
+      - .env
+
+    environment:
+      # Argus computes the trading date/time in US/Eastern explicitly
+      # (argus/clock.py), so this does NOT affect any trading decision. It only
+      # makes log timestamps read in exchange time instead of UTC, matching what
+      # a direct host run on an ET machine produces.
+      TZ: America/New_York
+
+      # WHICH CONFIG FILE. The profile names the file (`live` -> argus.live.toml);
+      # the file's own `environment` key remains the sole authority on trading
+      # behaviour, and the loader REFUSES when the two disagree.
+      #
+      # `${VAR:?message}` makes compose REFUSE rather than interpolate empty. Do
+      # NOT write `${ARGUS_ENV:-sandbox}`: a default here is precisely how the
+      # wrong config gets deployed quietly, which is the failure class the profile
+      # model exists to close. An unset variable must be a loud stop.
+      #
+      # It comes from /etc/argus/host.env via argus.service's EnvironmentFile —
+      # per host, root-owned, NOT in git, and deliberately NOT from ./.env, which
+      # is hand-edited, untouched by the deploy, and already the documented trap
+      # for ARGUS_IMAGE_TAG. Any HAND-RUN compose command therefore has to carry
+      # it too — sudo scrubs the environment, so it goes on sudo's own command
+      # line, and host.env is root-owned 600 so reading it needs sudo as well:
+      #
+      #   PROFILE="$(sudo sed -n 's/^ARGUS_ENV=//p' /etc/argus/host.env)"
+      #   sudo ARGUS_ENV="$PROFILE" docker compose -f /opt/argus/docker-compose.yml ps
+      #
+      ARGUS_ENV: ${ARGUS_ENV:?ARGUS_ENV must be set — see /etc/argus/host.env}
+      # The directory the profile resolves against. ARGUS_CONFIG is deliberately
+      # UNSET: an explicit path WINS over the profile (config.resolve_config_path),
+      # so setting it here would put the profile back to decorating a filename it
+      # no longer selects — and /status could no longer report which profile is
+      # armed. If ./.env on this host still carries a stale ARGUS_CONFIG line,
+      # delete it; env_file entries reach the container too.
+      ARGUS_CONFIG_DIR: /etc/argus
+      # Do not set DEBUG here. It no longer leaks a bearer token — `__main__.py`
+      # pins the tastytrade/httpx/websockets loggers to WARNING regardless of
+      # this level — but DEBUG is very noisy, container stdout goes to disk and
+      # to journald, and that pin only covers the loggers we knew to name.
+      # See the private deployment runbook, §17 (relocated from CLAUDE.md).
+      # INFO is also `__main__.py`'s own default, so an unset value is safe.
+      ARGUS_LOG_LEVEL: ${ARGUS_LOG_LEVEL:-INFO}
+
+    volumes:
+      # Persistent state: the hash-chained audit log + WAL sidecars. A named
+      # volume survives `down`, image rebuilds, and rollbacks. Keep this on the
+      # droplet's local disk — SQLite WAL is not safe over NFS.
+      - argus-state:/data
+      # Config bind-mounted read-only so COA timing and risk caps are retunable
+      # without a rebuild. NOTE: this means config does NOT roll back with the
+      # image tag — it is versioned by git on the droplet, not by the image.
+      # `/status` and the startup line carry a sha of these bytes for exactly that
+      # reason, and the deploy reads it back.
+      #
+      # The PROFILE STAYS IN THE FILENAME inside the container, deliberately.
+      # Mounting to a fixed `/etc/argus/argus.toml` would be one fewer moving part
+      # and would silently disarm the filename<->environment assertion — a
+      # profile-less name asserts nothing — so the process could no longer tell a
+      # live config from a cert one, nor report which it read.
+      #
+      # A profile with no matching file is a hard stop at startup, not a fallback:
+      # the mount creates a DIRECTORY where the file should be, and the loader
+      # refuses. That is the intended shape.
+      - ./argus.${ARGUS_ENV}.toml:/etc/argus/argus.${ARGUS_ENV}.toml:ro
+      # The macro-event blackout dates `[events] blackout_dates_path` points at.
+      # Mounted BESIDE the config and for the same reasons: retunable without a
+      # rebuild, and versioned by git on the droplet rather than by the image tag.
+      # It must move with the config — `enabled = true` against a missing file is
+      # a hard ConfigError and the process refuses to start.
+      - ./blackout_dates.txt:/etc/argus/blackout_dates.txt:ro
+
+    # Bounded log retention. An always-on process on a small droplet will
+    # otherwise fill the disk with json-file logs, and a full disk takes SQLite
+    # down with it.
+    #
+    # NON-BLOCKING delivery (added 2026-08-06). Docker's default is `blocking`,
+    # which blocks the writing process inside the container until the log driver
+    # has taken the message — i.e. a disk hiccup lands directly on the event loop
+    # that the watchdog, the price-walking loop's COA cycle and `POST /kill` all
+    # share. That is the wrong coupling for this process at any log volume.
+    #
+    # It matters more here than usual because Argus LOGS WHEN IT STALLS: every
+    # `loop_lag_breach` writes a line, so lag -> log -> block -> lag is a real
+    # feedback path, and with ARGUS_LOOP_DEBUG on it gets worse — slow-callback
+    # lines increase as the intra-session lag ramp develops, so log volume ramps
+    # with the very thing being measured.
+    #
+    # This is NOT a candidate for the ramp itself: ordinary log volume is flat
+    # across a session (~350 breach lines/hour) and rotation caps the file, so
+    # blocking mode is a constant tax and an amplifier, never a linear ramp.
+    #
+    # TRADEOFF, stated because it is a real loss of a guarantee: non-blocking
+    # buffers into a per-container ring and DROPS messages if the driver falls
+    # behind. Acceptable here and only here — the hash-chained audit log lives in
+    # SQLite on the volume, not in the journal, so what is at risk is operator
+    # log lines, never the trading record. Do not reason from this that dropping
+    # audit records is ever acceptable.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+        mode: non-blocking
+        max-buffer-size: "4m"
+
+    # --- alternative entry points ------------------------------------------
+    # Default CMD is `python -m argus` (the always-on supervisor).
+    #
+    # The full shadow pipeline is a TIME-BOXED tool: `argus.tools.shadow` exits
+    # after --minutes. Under `restart: unless-stopped` that clean exit is a
+    # restart, so it would relaunch in a loop. Only uncomment this with a
+    # --minutes long enough to cover the session, and understand the restart
+    # behaviour:
+    # command: ["python", "-m", "argus.tools.shadow", "--minutes", "390"]
+    #
+    # One-shot smoke tools run out-of-band instead, sharing the same volume:
+    #   sudo docker compose run --rm argus python -m argus.tools.quotes SPX
+    #   sudo docker compose run --rm argus python -m argus.tools.account
+
+volumes:
+  argus-state:
+    name: argus-state

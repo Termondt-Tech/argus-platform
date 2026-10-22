@@ -1,0 +1,44 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Local SQLite (audit log / cache) and WAL sidecars — never commit runtime data.
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# Dev scratch DB directory (argus.dev.toml writes here). Never the live chain.
+dev/
+*.db.lock
+
+# Archived databases (incident snapshots) — never committed
+archive/
+
+# The PRE-RENAME config name. Config is selected by PROFILE now
+# (argus.sandbox.toml / argus.live.toml / argus.dev.toml); this name carries no
+# profile, so the loader's filename<->environment assertion is not armed against
+# it and /status renders it amber. Ignored so a stray copy — a hand-made backup,
+# a half-finished cutover, muscle memory — cannot be committed back into the tree
+# and quietly become the file somebody points --config at.
+argus.toml
+
+# Rendered architecture diagrams (scripts/render-architecture.sh). Derived from
+# docs/architecture/*.md on demand — SVG and PDF for reading at full size and for
+# printing. Never committed: they are regenerable, they are large, and a stale
+# committed render is a second, silently-wrong copy of a diagram whose source is
+# right there beside it.
+build/
+
+# Google OAuth for the ledger Sheet (tools.sheets authorize). Kept under dev/,
+# but ignored by NAME too, so a copy made anywhere else cannot be committed.
+client_secret*.json
+google-oauth.json
+argus-sheets-key.json
+*service-account*.json
+
+.claude/worktrees/
+.claude/settings.local.json

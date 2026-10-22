@@ -1,0 +1,99 @@
+# Argus — systemd supervision for the always-on Compose stack.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THIS IS THE UNIT TO ENABLE during shadow phase. It runs the compose default
+# command, `python -m argus` — the always-on supervisor, which now owns the
+# signal loop: it runs one shadow session per trading day (market calendar in
+# the profile's `[market]`), from the open to the close, idling in between. It logs
+# in per session with in-app, ban-aware retry, so cert warmup failures no longer
+# need systemd restart tuning to absorb them.
+#
+# MIGRATION ORDER (single-writer lock — both units taking it crash-loops the
+# loser): STOP and DISABLE argus-shadow.timer BEFORE enabling this unit.
+#   sudo systemctl disable --now argus-shadow.timer
+#   sudo systemctl cp/enable this unit (below)
+# argus-shadow.timer is RETIRED — the time-boxed one-shot model it drove is
+# superseded now that the loop is always-on. See README §4.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Install:
+#   sudo systemctl disable --now argus-shadow.timer   # if it was enabled
+#   # THE PROFILE FIRST — this unit will not start without it (EnvironmentFile,
+#   # below, carries no `-` prefix). One line: ARGUS_ENV=sandbox
+#   sudo install -d -m 700 /etc/argus
+#   printf 'ARGUS_ENV=sandbox\n' | sudo tee /etc/argus/host.env >/dev/null
+#   sudo chmod 600 /etc/argus/host.env
+#   sudo cp /opt/argus/argus.service /etc/systemd/system/argus.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now argus.service
+#
+# This unit runs as root and shells out to `docker compose`. That is deliberate:
+# the deploy user is NOT in the `docker` group (membership there is equivalent to
+# root on the host), so all deploy actions go through `sudo`.
+
+[Unit]
+Description=Argus 0DTE SPX execution system
+Documentation=file:/opt/argus/CLAUDE.md
+
+# Requires= (not just After=) so the unit stops if the Docker daemon goes away,
+# rather than sitting "active" while nothing is actually running.
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+# Restart=always + a hard-failing config would otherwise spin forever. Five
+# failures inside two minutes means the problem is not transient (a broken image,
+# a bad config, a wedged volume) — stop and leave the unit failed so it is
+# visible in `systemctl status`. NOTE: cert warmup failures at the open no longer
+# reach here — the always-on process retries login IN-APP (bounded, ban-aware;
+# the profile's [market] login_attempts / login_retry_interval_s) and never exits on
+# a failed login, so these limits now guard genuine process/compose crashes only.
+# (These are [Unit] keys since systemd 229, not [Service].)
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/argus
+
+# WHICH CONFIG PROFILE THIS HOST RUNS. One line, `ARGUS_ENV=sandbox` (or `live`).
+# docker-compose.yml interpolates it into both the container's environment and the
+# config bind-mount path, with `${ARGUS_ENV:?}` so compose REFUSES rather than
+# defaulting.
+#
+# Root-owned, mode 600, PER HOST, and deliberately NOT in git — the cutover is
+# this file changing on the droplet, not a commit. Provisioned once beside the
+# secrets (runbook §8).
+#
+# NO `-` PREFIX, deliberately: a missing file must fail the unit loudly. With `-`
+# systemd would start anyway with the variable unset, compose would refuse on
+# `${ARGUS_ENV:?}`, and the failure would arrive one layer further from its cause.
+# It is also NOT ./.env — that file is hand-edited, is not touched by the deploy,
+# and is already the documented trap for ARGUS_IMAGE_TAG.
+EnvironmentFile=/etc/argus/host.env
+
+# Foreground `up` — no -d. The compose process stays in the foreground as the
+# unit's main process, so systemd tracks real liveness and container stdout is
+# relayed into the journal.
+ExecStart=/usr/bin/docker compose -f /opt/argus/docker-compose.yml up
+ExecStop=/usr/bin/docker compose -f /opt/argus/docker-compose.yml down
+
+# Second supervision layer: covers compose itself dying. The container-level
+# `restart: unless-stopped` covers the process inside dying.
+Restart=always
+RestartSec=10s
+
+# Must exceed the container's stop_grace_period (30s) plus compose's own
+# teardown, or systemd SIGKILLs mid-shutdown and the audit queue loses its
+# final drain.
+TimeoutStopSec=90s
+
+# Startup pulls/starts containers; do not let a slow first start be killed.
+TimeoutStartSec=300s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=argus
+
+[Install]
+WantedBy=multi-user.target

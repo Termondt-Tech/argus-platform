@@ -1,0 +1,22 @@
+-- 0003_audit_status_index: composite index for the read-only status surface.
+--
+-- The monitoring endpoint (status.py, spec §3/§5) issues a "how many
+-- shadow.would_submit today?" COUNT — `WHERE category = ? AND ts >= ?`. With only
+-- the single-column indexes from 0001, the planner picks idx_audit_log_category
+-- and scans EVERY would_submit row in history (all days), not just today's — a
+-- cost that grows without bound as continuous shadow logging accumulates (~3k
+-- would_submit rows/day). Measured at 480k rows that COUNT was ~20 ms and climbing.
+--
+-- Why this matters beyond the query itself: that read runs under the audit log's
+-- chain lock (AuditLog.read holds _chain_lock so the shared connection is never
+-- touched by two threads at once), the SAME lock a crash-critical Tier-1 write
+-- takes. A 20-ms-and-growing scan there would delay exactly the writes spec §6/§9
+-- exist to keep fast during a volatility spike. This composite index bounds the
+-- COUNT to (category, ts>=today) — the same 480k-row table drops it to ~0.06 ms,
+-- flat in total history — so the lock is held only microseconds.
+--
+-- The leading `category` column also serves the equality/`ORDER BY seq` lookups
+-- (latest kill_switch.trip, today's daily_loss.breach) as well as the old
+-- category index did. Immutable: never edit this file — add a new migration.
+
+CREATE INDEX idx_audit_category_ts ON audit_log (category, ts);
